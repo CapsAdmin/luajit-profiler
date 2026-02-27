@@ -46,432 +46,589 @@ do
 	end
 end
 
-local profile_events = {}
+-- Helper dependencies
+local jutil = require("jit.util")
+local vmdef = require("jit.vmdef")
+local jit_attach = _G.jit.attach
+local table_concat = _G.table.concat
+local table_insert = _G.table.insert
+local table_remove = _G.table.remove
+local string_format = _G.string.format
+local ffnames = vmdef.ffnames
 
-do
-	local events = {}
-	local event_count = 0
-	local flush_callback = nil
-	local last_flush_time = 0
-	local flush_interval = 3
+-- --- Helpers ---
 
-	function profile_events.emit(event)
-		event_count = event_count + 1
-		event.time = get_time()
-		events[event_count] = event
+local function format_error(err, arg)
+	local fmt = vmdef.traceerr[err]
+
+	if not fmt then return "unknown error: " .. err end
+
+	if not arg then return fmt end
+
+	if fmt:sub(1, #"NYI: bytecode") == "NYI: bytecode" then
+		local oidx = 6 * arg
+		arg = vmdef.bcnames:sub(oidx + 1, oidx + 6):gsub("%s+$", "")
+		fmt = "NYI bytecode %s"
 	end
 
-	function profile_events.check_flush()
-		local now = get_time()
+	return string_format(fmt, arg)
+end
 
-		if now - last_flush_time >= flush_interval then
-			last_flush_time = now
+local function create_warn_log(interval)
+	local i = 0
+	local last_time = 0
+	return function()
+		i = i + 1
 
-			if flush_callback then flush_callback(events, event_count) end
+		if last_time < os.clock() then
+			last_time = os.clock() + interval
+			return i, interval
 		end
-	end
 
-	function profile_events.get_events()
-		return events, event_count
-	end
-
-	function profile_events.clear()
-		events = {}
-		event_count = 0
-	end
-
-	function profile_events.set_flush_callback(cb)
-		flush_callback = cb
-	end
-
-	function profile_events.set_flush_interval(seconds)
-		flush_interval = seconds
-	end
-
-	function profile_events.reset()
-		events = {}
-		event_count = 0
-		flush_callback = nil
-		last_flush_time = 0
+		return false
 	end
 end
 
-local jit_profiler = {}
+local function format_func_info(fi, func)
+	if fi.loc and fi.currentline ~= 0 then
+		local source = fi.source
 
-do
-	--ANALYZE
-	local table_concat = _G.table.concat
-	local table_insert = _G.table.insert
-	-- Section tracking state
-	local profiler_active = false
-	local section_stack = {}
-	local current_section_path = ""
+		if source:sub(1, 1) == "@" then source = source:sub(2) end
 
-	function jit_profiler.StartSection(name--[[#: string]])
-		if not profiler_active then return end
+		if source:sub(1, 2) == "./" then source = source:sub(3) end
 
-		table_insert(section_stack, name)
-		current_section_path = table_concat(section_stack, " > ")
-		profile_events.emit({type = "section_start", name = name, section_path = current_section_path})
+		return source .. ":" .. fi.currentline
+	elseif fi.ffid then
+		return vmdef.ffnames[fi.ffid]
+	elseif fi.addr then
+		return string_format("C:%x, %s", fi.addr, tostring(func))
+	else
+		return "(?)"
+	end
+end
+
+local function translate_stack(stack)
+	stack = stack:gsub("%[builtin#(%d+)%]", function(n)
+		local num = tonumber(n)
+		return ffnames[num] or ("[builtin#" .. n .. "]")
+	end)
+	stack = stack:gsub("@0x%x+\n?", "")
+	stack = stack:gsub("%(command line%)[^\n]*\n?", "")
+	stack = stack:gsub("%s+$", "")
+	return stack
+end
+
+local function json_string(s)
+	s = s:gsub("\\", "\\\\")
+	s = s:gsub("\"", "\\\"")
+	s = s:gsub("\n", "\\n")
+	s = s:gsub("\r", "\\r")
+	s = s:gsub("\t", "\\t")
+	return "\"" .. s .. "\""
+end
+
+-- --- Profiler ---
+
+local HTML_TEMPLATE -- forward declaration, assigned at bottom of file
+
+local FILE_URL_TEMPLATES = {
+	vscode = "vscode://file/${path}:${line}:1",
+	sublime = "subl://open?url=file://${path}&line=${line}",
+	atom = "atom://core/open/file?filename=${path}&line=${line}",
+}
+
+local META = {}
+META.__index = META
+
+-- --- Event accumulation ---
+
+local function emit(self, event)
+	self._event_count = self._event_count + 1
+	event.time = self._get_time()
+	self._events[self._event_count] = event
+end
+
+local function check_flush(self)
+	local now = self._get_time()
+
+	if now - self._last_flush_time >= self._flush_interval then
+		self._last_flush_time = now
+		self:Save()
+	end
+end
+
+-- --- String interning ---
+
+local function intern(self, s)
+	if s == nil then return -1 end
+
+	local idx = self._string_lookup[s]
+
+	if idx then return idx end
+
+	idx = self._string_count
+	self._string_count = self._string_count + 1
+	self._strings[idx] = s
+	self._string_lookup[s] = idx
+	return idx
+end
+
+local function get_new_strings(self)
+	local new = {}
+
+	for i = self._strings_flushed, self._string_count - 1 do
+		new[#new + 1] = self._strings[i]
 	end
 
-	function jit_profiler.StopSection()
-		if not profiler_active then return end
+	self._strings_flushed = self._string_count
+	return new
+end
 
-		local name = section_stack[#section_stack]
+-- --- Section tracking ---
 
-		if #section_stack > 0 then
-			section_stack[#section_stack] = nil
-			current_section_path = table_concat(section_stack, " > ")
+function META:StartSection(name)
+	if not self._running then return end
+
+	-- Simple timing
+	self._simple_times[name] = self._simple_times[name] or {total = 0}
+	self._simple_times[name].time = self._get_time()
+	table_insert(self._simple_stack, name)
+
+	-- Event section tracking
+	table_insert(self._section_stack, name)
+	self._section_path = table_concat(self._section_stack, " > ")
+	emit(self, {type = "section_start", name = name, section_path = self._section_path})
+end
+
+function META:StopSection()
+	if not self._running then return end
+
+	local name = self._section_stack[#self._section_stack]
+
+	if #self._section_stack > 0 then
+		self._section_stack[#self._section_stack] = nil
+		self._section_path = table_concat(self._section_stack, " > ")
+	end
+
+	emit(self, {type = "section_end", name = name, section_path = self._section_path})
+
+	-- Simple timing
+	local sname = table_remove(self._simple_stack)
+
+	if sname and self._simple_times[sname] then
+		self._simple_times[sname].total = self._simple_times[sname].total + (self._get_time() - self._simple_times[sname].time)
+	end
+end
+
+-- --- Trace tracking ---
+
+local function on_trace_start(self, id, func, pc, parent_id, exit_id)
+	local fi = jutil.funcinfo(func, pc)
+	local loc = format_func_info(fi, func)
+	local depth = 0
+	local parent = parent_id and self._traces[parent_id]
+
+	if parent then depth = (parent.depth or 0) + 1 end
+
+	self._traces[id] = {id = id, parent_id = parent_id, exit_id = exit_id, depth = depth}
+	self._trace_count = self._trace_count + 1
+	emit(self,
+		{
+			type = "trace_start",
+			id = id,
+			parent_id = parent_id,
+			exit_id = exit_id,
+			depth = depth,
+			func_info = loc,
+		}
+	)
+end
+
+local function on_trace_stop(self, id, func)
+	local trace = self._traces[id]
+
+	if not trace then return end
+
+	local ti = jutil.traceinfo(id)
+	local fi = jutil.funcinfo(func)
+	local loc = format_func_info(fi, func)
+	emit(self,
+		{
+			type = "trace_stop",
+			id = id,
+			func_info = loc,
+			linktype = ti and ti.linktype or nil,
+			link_id = ti and ti.link or nil,
+			ir_count = ti and ti.nins or nil,
+			exit_count = ti and ti.nexit or nil,
+		}
+	)
+end
+
+local function on_trace_abort(self, id, func, pc, code, reason)
+	local trace = self._traces[id]
+
+	if not trace then return end
+
+	local fi = jutil.funcinfo(func, pc)
+	local loc = format_func_info(fi, func)
+	self._aborted[id] = true
+	self._traces[id] = nil
+	self._trace_count = self._trace_count - 1
+
+	emit(self,
+		{
+			type = "trace_abort",
+			id = id,
+			abort_code = code,
+			abort_reason = format_error(code, reason),
+			func_info = loc,
+		}
+	)
+
+	if code == 27 then
+		local x, interval = self._should_warn_mcode()
+
+		if x then
+			io.write(
+				format_error(code, reason),
+				x == 0 and "" or " [" .. x .. " times the last " .. interval .. " seconds]",
+				"\n"
+			)
 		end
+	end
+end
 
-		profile_events.emit({type = "section_end", name = name, section_path = current_section_path})
+local function on_trace_flush(self)
+	if self._trace_count > 0 then
+		local x, interval = self._should_warn_abort()
+
+		if x then
+			io.write(
+				"flushing ",
+				self._trace_count,
+				" traces, ",
+				(x == 0 and "" or "[" .. x .. " times the last " .. interval .. " seconds]"),
+				"\n"
+			)
+		end
 	end
 
-	function jit_profiler.Start(config)
-		config = config or {}
-		config.mode = config.mode or "line"
-		config.depth = config.depth or 500
-		config.sampling_rate = config.sampling_rate or 1
-		local ok, func = pcall(require, "jit.profile")
+	self._traces = {}
+	self._aborted = {}
+	self._trace_count = 0
+	emit(self, {type = "trace_flush"})
+end
 
-		if not ok then return nil, func end
+local function attach_traces(self)
+	if not jit_attach or not jutil.funcinfo or not jutil.traceinfo then return end
 
-		profiler_active = true
-		section_stack = {}
-		current_section_path = ""
-		local jp = func
-		local dumpstack = jp.dumpstack
+	local prof = self
 
-		jp.start((config.mode == "line" and "l" or "f") .. "i" .. config.sampling_rate, function(thread, sample_count, vmstate)
-			profile_events.emit(
+	self._trace_event_fn = function(what, tr, func, pc, otr, oex)
+		if what == "start" then
+			on_trace_start(prof, tr, func, pc, otr, oex)
+		elseif what == "stop" then
+			on_trace_stop(prof, tr, func)
+		elseif what == "abort" then
+			on_trace_abort(prof, tr, func, pc, otr, oex)
+		elseif what == "flush" then
+			on_trace_flush(prof)
+		end
+	end
+
+	self._trace_event_safe_fn = function(what, tr, func, pc, otr, oex)
+		local ok, err = pcall(self._trace_event_fn, what, tr, func, pc, otr, oex)
+
+		if not ok then io.write("error in trace event (" .. tostring(what) .. "): " .. tostring(err) .. "\n") end
+	end
+
+	jit_attach(self._trace_event_safe_fn, "trace")
+end
+
+local function detach_traces(self)
+	if self._trace_event_safe_fn then
+		jit_attach(self._trace_event_safe_fn)
+		self._trace_event_fn = nil
+		self._trace_event_safe_fn = nil
+	end
+end
+
+-- --- JIT sampling ---
+
+local function start_sampling(self)
+	local ok, jp = pcall(require, "jit.profile")
+
+	if not ok then return end
+
+	local prof = self
+	local dumpstack = jp.dumpstack
+	local depth = self._depth
+	local section_path_ref = function() return prof._section_path end
+
+	jp.start(
+		(self._mode == "line" and "l" or "f") .. "i" .. self._sampling_rate,
+		function(thread, sample_count, vmstate)
+			emit(prof,
 				{
 					type = "sample",
-					stack = dumpstack(thread, "pl\n", config.depth),
+					stack = dumpstack(thread, "pl\n", depth),
 					sample_count = sample_count,
 					vm_state = vmstate,
-					section_path = current_section_path,
+					section_path = prof._section_path,
 				}
 			)
-			profile_events.check_flush()
-		end)
-
-		return function()
-			jp.stop()
-			profiler_active = false
+			check_flush(prof)
 		end
+	)
+
+	self._jp = jp
+end
+
+-- --- Encoding ---
+
+local function encode_event(self, ev)
+	local t = ev.type
+	local ti = intern(self, t)
+
+	if t == "sample" then
+		local stack_str = ev.stack
+
+		if stack_str and type(stack_str) == "string" then
+			stack_str = translate_stack(stack_str)
+		end
+
+		local frames = {}
+
+		if stack_str and stack_str ~= "" then
+			for line in stack_str:gmatch("[^\n]+") do
+				frames[#frames + 1] = intern(self, line)
+			end
+		end
+
+		return string_format(
+			"[%d,%.6f,[%s],%d,%d,%d]",
+			ti,
+			ev.time,
+			table_concat(frames, ","),
+			ev.sample_count or 0,
+			intern(self, ev.vm_state),
+			intern(self, ev.section_path)
+		)
+	elseif t == "section_start" or t == "section_end" then
+		return string_format(
+			"[%d,%.6f,%d,%d]",
+			ti,
+			ev.time,
+			intern(self, ev.name),
+			intern(self, ev.section_path)
+		)
+	elseif t == "trace_start" then
+		return string_format(
+			"[%d,%.6f,%d,%s,%s,%d,%d]",
+			ti,
+			ev.time,
+			ev.id or 0,
+			ev.parent_id and tostring(ev.parent_id) or "null",
+			ev.exit_id and tostring(ev.exit_id) or "null",
+			ev.depth or 0,
+			intern(self, ev.func_info)
+		)
+	elseif t == "trace_stop" then
+		return string_format(
+			"[%d,%.6f,%d,%d,%d,%s,%d,%d]",
+			ti,
+			ev.time,
+			ev.id or 0,
+			intern(self, ev.func_info),
+			intern(self, ev.linktype),
+			ev.link_id and tostring(ev.link_id) or "null",
+			ev.ir_count or 0,
+			ev.exit_count or 0
+		)
+	elseif t == "trace_abort" then
+		return string_format(
+			"[%d,%.6f,%d,%s,%d,%d]",
+			ti,
+			ev.time,
+			ev.id or 0,
+			ev.abort_code and tostring(ev.abort_code) or "null",
+			intern(self, ev.abort_reason),
+			intern(self, ev.func_info)
+		)
+	else
+		return string_format("[%d,%.6f]", ti, ev.time)
 	end
 end
 
-local TraceTrack = {}
+local function encode_chunk(self, start_idx, end_idx)
+	local event_parts = {}
 
-do
-	local jutil = require("jit.util")
-	local vmdef = require("jit.vmdef")
-	local assert = _G.assert
-	local table = _G.table
-	local jit_attach = _G.jit.attach
-	local string = _G.string
-	local table_insert = table.insert
-	local trace_errors_reverse = {}
-
-	for code, fmt in pairs(vmdef.traceerr) do
-		trace_errors_reverse[fmt] = code
+	for i = start_idx, end_idx do
+		event_parts[#event_parts + 1] = encode_event(self, self._events[i])
 	end
 
-	local function format_error(err--[[#: number]], arg--[[#: number | nil]])
-		local fmt = vmdef.traceerr[err]
+	local new_strings = get_new_strings(self)
+	local string_parts = {}
 
-		if not fmt then return "unknown error: " .. err end
-
-		if not arg then return fmt end
-
-		if fmt:sub(1, #"NYI: bytecode") == "NYI: bytecode" then
-			local oidx = 6 * arg
-			arg = vmdef.bcnames:sub(oidx + 1, oidx + 6):gsub("%s+$", "")
-			fmt = "NYI bytecode %s"
-		end
-
-		return string.format(fmt, arg)
+	for i = 1, #new_strings do
+		string_parts[i] = json_string(new_strings[i])
 	end
 
-	local function create_warn_log(interval)
-		local i = 0
-		local last_time = 0
-		return function()
-			i = i + 1
+	return "[" .. table_concat(string_parts, ",") .. "]",
+		"[" .. table_concat(event_parts, ",") .. "]"
+end
 
-			if last_time < os.clock() then
-				last_time = os.clock() + interval
-				return i, interval
-			end
+-- --- HTML I/O ---
 
-			return false
-		end
-	end
+local function begin_html(self)
+	local html = HTML_TEMPLATE
+	html = html:gsub("%%TITLE%%", self._id)
+	html = html:gsub("%%TITLE_JSON%%", function()
+		return json_string(self._id)
+	end)
+	html = html:gsub("%%ROOT_PATH_JSON%%", function()
+		return json_string((os.getenv("PWD") or ""):gsub("[\\/]+$", ""))
+	end)
+	html = html:gsub("%%FILE_URL_JSON%%", function()
+		return json_string(self._file_url)
+	end)
+	local f = assert(io.open(self._path, "w"))
+	f:write(html)
+	f:flush()
+	return f
+end
 
-	local function format_func_info(fi--[[#: ReturnType<|jutil.funcinfo|>[1] ]], func--[[#: Function]])
-		if fi.loc and fi.currentline ~= 0 then
-			local source = fi.source
+local function write_chunk(self, start_idx, end_idx)
+	if start_idx > end_idx then return end
+	if not self._file then return end
 
-			if source:sub(1, 1) == "@" then source = source:sub(2) end
+	local strings_js, events_js = encode_chunk(self, start_idx, end_idx)
+	self._file:write("<script>_C(")
+	self._file:write(strings_js)
+	self._file:write(",")
+	self._file:write(events_js)
+	self._file:write(");</script>\n")
+	self._file:flush()
+end
 
-			if source:sub(1, 2) == "./" then source = source:sub(3) end
-
-			return source .. ":" .. fi.currentline
-		elseif fi.ffid then
-			return vmdef.ffnames[fi.ffid]
-		elseif fi.addr then
-			return string.format("C:%x, %s", fi.addr, tostring(func))
-		else
-			return "(?)"
-		end
-	end
-
-	local META = {}
-	META.__index = META
-
-	function TraceTrack.New()
-		if not jit_attach or not jutil.funcinfo or not jutil.traceinfo then
-			return nil
-		end
-
-		local self = setmetatable({}, META)
-		self._started = false
-		self._should_warn_mcode = create_warn_log(2)
-		self._should_warn_abort = create_warn_log(8)
-		self._traces = {}
-		self._aborted = {}
-		self._trace_count = 0
-		self._on_trace_event = nil
-		return self
-	end
-
-	function META:_on_start(
-		id--[[#: number]],
-		func--[[#: Function]],
-		pc--[[#: number]],
-		parent_id--[[#: nil | number]],
-		exit_id--[[#: nil | number]]
-	)
-		local fi = jutil.funcinfo(func, pc)
-		local loc = format_func_info(fi, func)
-		local depth = 0
-		local parent = parent_id and self._traces[parent_id]
-
-		if parent then depth = (parent.depth or 0) + 1 end
-
-		self._traces[id] = {id = id, parent_id = parent_id, exit_id = exit_id, depth = depth}
-		self._trace_count = self._trace_count + 1
-		profile_events.emit(
-			{
-				type = "trace_start",
-				id = id,
-				parent_id = parent_id,
-				exit_id = exit_id,
-				depth = depth,
-				func_info = loc,
-			}
-		)
-	end
-
-	function META:_on_stop(id--[[#: number]], func--[[#: Function]])
-		local trace = self._traces[id]
-
-		if not trace then return end
-
-		local ti = jutil.traceinfo(id)
-		local fi = jutil.funcinfo(func)
-		local loc = format_func_info(fi, func)
-		profile_events.emit(
-			{
-				type = "trace_stop",
-				id = id,
-				func_info = loc,
-				linktype = ti and ti.linktype or nil,
-				link_id = ti and ti.link or nil,
-				ir_count = ti and ti.nins or nil,
-				exit_count = ti and ti.nexit or nil,
-			}
-		)
-	end
-
-	function META:_on_abort(
-		id--[[#: number]],
-		func--[[#: Function]],
-		pc--[[#: number]],
-		code--[[#: number]],
-		reason--[[#: number]]
-	)
-		local trace = self._traces[id]
-
-		if not trace then return end
-
-		local fi = jutil.funcinfo(func, pc)
-		local loc = format_func_info(fi, func)
-		self._aborted[id] = true
-
-		if trace then
-			self._traces[id] = nil
-			self._trace_count = self._trace_count - 1
-		end
-
-		profile_events.emit(
-			{
-				type = "trace_abort",
-				id = id,
-				abort_code = code,
-				abort_reason = format_error(code, reason),
-				func_info = loc,
-			}
-		)
-
-		-- mcode allocation issues should be logged right away
-		if code == 27 then
-			local x, interval = self._should_warn_mcode()
-
-			if x then
-				io.write(
-					format_error(code, reason),
-					x == 0 and "" or " [" .. x .. " times the last " .. interval .. " seconds]",
-					"\n"
-				)
-			end
-		end
-	end
-
-	function META:_on_flush()
-		if self._trace_count > 0 then
-			local x, interval = self._should_warn_abort()
-
-			if x then
-				io.write(
-					"flushing ",
-					self._trace_count,
-					" traces, ",
-					(x == 0 and "" or "[" .. x .. " times the last " .. interval .. " seconds]"),
-					"\n"
-				)
-			end
-		end
-
-		self._traces = {}
-		self._aborted = {}
-		self._trace_count = 0
-		profile_events.emit({type = "trace_flush"})
-	end
-
-	function META:Start()
-		if self._started then return end
-
-		self._started = true
-		local self_ref = self
-		self._on_trace_event = function(what, tr, func, pc, otr, oex)
-			if what == "start" then
-				self_ref:_on_start(tr, func, pc, otr, oex)
-			elseif what == "stop" then
-				self_ref:_on_stop(tr, func)
-			elseif what == "abort" then
-				self_ref:_on_abort(tr, func, pc, otr, oex)
-			elseif what == "flush" then
-				self_ref:_on_flush()
-			else
-				error("unknown trace event " .. what)
-			end
-		end
-		self._on_trace_event_safe = function(what, tr, func, pc, otr, oex)
-			local ok, err = pcall(self._on_trace_event, what, tr, func, pc, otr, oex)
-
-			if not ok then io.write("error in trace event: " .. tostring(err) .. "\n") end
-		end
-		jit_attach(self._on_trace_event_safe, "trace")
-	end
-
-	function META:Stop()
-		if not self._started then return end
-
-		self._started = false
-		jit_attach(self._on_trace_event)
+local function finish_html(self)
+	if self._file then
+		self._file:close()
+		self._file = nil
 	end
 end
 
-local profile_html = {}
+-- --- Constructor ---
 
-do
-	local vmdef = require("jit.vmdef")
-	local ffnames = vmdef.ffnames
+local function profiler_new(config)
+	config = config or {}
 
-	local function translate_stack(stack--[[#: string]])
-		-- Replace [builtin#N] with human-readable names from vmdef.ffnames
-		stack = stack:gsub("%[builtin#(%d+)%]", function(n)
-			local num = tonumber(n)
-			return ffnames[num] or ("[builtin#" .. n .. "]")
-		end)
-		-- Strip @0xADDR lines (C function pointers with no useful info)
-		stack = stack:gsub("@0x%x+\n?", "")
-		-- Strip (command line) entries
-		stack = stack:gsub("%(command line%)[^\n]*\n?", "")
-		-- Remove trailing whitespace/newlines
-		stack = stack:gsub("%s+$", "")
-		return stack
+	local self = setmetatable({}, META)
+
+	-- Config
+	self._id = config.id or "global"
+	self._path = config.path or ("profile_summary_" .. self._id .. ".html")
+	local file_url = config.file_url or "vscode"
+	self._file_url = FILE_URL_TEMPLATES[file_url] or file_url
+	self._mode = config.mode or "line"
+	self._depth = config.depth or 500
+	self._sampling_rate = config.sampling_rate or 1
+	self._flush_interval = config.flush_interval or 3
+	self._get_time = config.get_time or get_time
+
+	-- Lifecycle
+	self._time_start = self._get_time()
+	self._running = true
+
+	-- Event accumulation
+	self._events = {}
+	self._event_count = 0
+	self._last_flush_time = 0
+
+	-- String interning
+	self._strings = {}
+	self._string_lookup = {}
+	self._string_count = 0
+	self._strings_flushed = 0
+
+	-- Section tracking
+	self._section_stack = {}
+	self._section_path = ""
+	self._simple_times = {}
+	self._simple_stack = {}
+
+	-- Trace tracking
+	self._traces = {}
+	self._trace_count = 0
+	self._aborted = {}
+	self._should_warn_mcode = create_warn_log(2)
+	self._should_warn_abort = create_warn_log(8)
+
+	-- HTML streaming
+	self._last_flushed_idx = 0
+	self._file = begin_html(self)
+
+	-- Attach trace events
+	attach_traces(self)
+
+	-- Start JIT profiler
+	start_sampling(self)
+
+	return self
+end
+
+-- --- Public API ---
+
+function META:Save()
+	if not self._file then return end
+
+	local count = self._event_count
+
+	if count > self._last_flushed_idx then
+		write_chunk(self, self._last_flushed_idx + 1, count)
+		self._last_flushed_idx = count
+	end
+end
+
+function META:Stop()
+	if not self._running then return end
+
+	self._running = false
+
+	-- Stop JIT profiler
+	if self._jp then
+		self._jp.stop()
+		self._jp = nil
 	end
 
-	-- Minimal JSON encoder for events
-	local function json_string(s)
-		s = s:gsub("\\", "\\\\")
-		s = s:gsub("\"", "\\\"")
-		s = s:gsub("\n", "\\n")
-		s = s:gsub("\r", "\\r")
-		s = s:gsub("\t", "\\t")
-		return "\"" .. s .. "\""
-	end
+	-- Detach trace events
+	detach_traces(self)
 
-	local function json_value(v)
-		local t = type(v)
+	-- Write remaining events and close file
+	self:Save()
+	finish_html(self)
+end
 
-		if t == "string" then
-			return json_string(v)
-		elseif t == "number" then
-			if v ~= v then return "null" end -- nan
-			if v == math.huge then return "1e999" end
+function META:GetEvents()
+	return self._events, self._event_count
+end
 
-			if v == -math.huge then return "-1e999" end
+function META:GetSimpleSections()
+	return self._simple_times
+end
 
-			return string.format("%.6f", v)
-		elseif t == "boolean" then
-			return v and "true" or "false"
-		elseif t == "nil" then
-			return "null"
-		else
-			return "\"" .. tostring(v) .. "\""
-		end
-	end
+function META:IsRunning()
+	return self._running
+end
 
-	local function json_event(ev)
-		local parts = {}
+function META:GetElapsed()
+	return self._get_time() - self._time_start
+end
 
-		for k, v in pairs(ev) do
-			local val = v
+-- --- HTML Template ---
 
-			if k == "stack" and type(v) == "string" then val = translate_stack(v) end
-
-			parts[#parts + 1] = json_string(k) .. ":" .. json_value(val)
-		end
-
-		return "{" .. table.concat(parts, ",") .. "}"
-	end
-
-	local function events_to_json(events, count)
-		local parts = {}
-
-		for i = 1, count do
-			parts[i] = json_event(events[i])
-		end
-
-		return "[" .. table.concat(parts, ",\n") .. "]"
-	end
-
-	local HTML_TEMPLATE = [==[
+HTML_TEMPLATE = [==[
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -496,8 +653,8 @@ do
   --color-jit:   #ffd166;
   --color-select:#ffc832;
 }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(--bg-base); color: #e0e0e0; }
+* { margin: 0; padding: 0; box-sizing: border-box; font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; }
+body { background: var(--bg-base); color: #e0e0e0; }
 #header { padding: 8px 16px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 #header .stats { font-size: 12px; color: var(--text-muted); }
 #timeline-container { position: relative; background: #141414; border-bottom: none; overflow: hidden; cursor: crosshair; }
@@ -508,7 +665,7 @@ body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(-
 #selection-overlay { position: absolute; top: 0; background: var(--accent-dim); border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); pointer-events: none; display: none; overflow: visible; }
 
 #timeline-controls { padding: 6px 16px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: center; font-size: 12px; flex-wrap: wrap; }
-#timeline-controls button { background: var(--bg-elevated); border: 1px solid var(--border-strong); color: #ccc; padding: 4px 12px; border-radius: 3px; cursor: pointer; font-size: 11px; font-family: inherit; }
+#timeline-controls button { background: var(--bg-elevated); border: 1px solid var(--border-strong); color: #ccc; padding: 4px 12px; border-radius: 3px; cursor: pointer; font-size: 11px; }
 #timeline-controls button:hover { background: var(--bg-hover); border-color: var(--accent); }
 #selection-info { color: var(--text-muted); }
 #fg-section-filter { background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 6px 16px; display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; font-size: 11px; }
@@ -516,7 +673,7 @@ body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(-
 #fg-section-filter label:hover { color: var(--accent); }
 #fg-section-filter label input { accent-color: var(--accent); cursor: pointer; }
 .section-header { padding: 0; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; align-items: stretch; flex-shrink: 0; cursor: pointer; }
-.section-header button { background: transparent; border: none; color: var(--accent); padding: 5px 16px; cursor: pointer; font-size: 12px; font-family: inherit; font-weight: 600; width: 100%; text-align: left; }
+.section-header button { background: transparent; border: none; color: var(--accent); padding: 5px 16px; cursor: pointer; font-size: 12px; font-weight: 600; width: 100%; text-align: left; }
 .section-header:hover button { color: #fff; background: rgba(255,255,255,0.04); }
 #trace-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); overflow: hidden; height: 0; }
 #trace-panel.open { overflow: auto; }
@@ -526,10 +683,10 @@ body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(-
 #trace-sticky-top { position: sticky; top: 0; z-index: 2; background: var(--bg-panel); }
 #trace-filter-header { padding: 6px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
 #trace-filter-header:empty { display: none; }
-#trace-filter-header button { background: var(--bg-elevated); border: 1px solid var(--border-strong); color: #ccc; padding: 2px 10px; border-radius: 3px; cursor: pointer; font-size: 11px; font-family: inherit; }
+#trace-filter-header button { background: var(--bg-elevated); border: 1px solid var(--border-strong); color: #ccc; padding: 2px 10px; border-radius: 3px; cursor: pointer; font-size: 11px; }
 #trace-filter-header button:hover { background: var(--bg-hover); border-color: var(--accent); }
 #trace-panel table { width: 100%; border-collapse: collapse; font-size: 11px; }
-#trace-panel th { position: sticky; background: var(--bg-elevated); padding: 6px 10px; text-align: left; color: var(--accent); border-bottom: 1px solid var(--border-strong); font-weight: 600; cursor: pointer; user-select: none; }
+#trace-panel th { position: sticky; z-index: 2; background: var(--bg-elevated); padding: 6px 10px; text-align: left; color: var(--accent); border-bottom: 1px solid var(--border-strong); font-weight: 600; cursor: pointer; user-select: none; }
 #trace-panel th:hover { color: #fff; }
 #trace-panel td { padding: 4px 10px; border-bottom: 1px solid var(--bg-panel); }
 #trace-panel tr.trace-row { cursor: pointer; }
@@ -547,6 +704,7 @@ body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(-
 #filter-panel label { display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 2px 0; white-space: nowrap; }
 #filter-panel label:hover { color: #fff; }
 #filter-panel .filter-count { color: var(--text-dim); font-size: 10px; }
+.custom-cb { font-size: 13px; line-height: 1; font-family: monospace; display: inline-block; width: 1.1em; }
 #filter-panel .filter-all-btn, #filter-panel .filter-none-btn { display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 2px 0; white-space: nowrap; font-size: 11px; user-select: none; }
 #filter-panel .filter-all-btn:hover, #filter-panel .filter-none-btn:hover { color: #fff; }
 #flamegraph-container { overflow: hidden; max-height: 0; transition: max-height 0.3s ease; flex-shrink: 0; }
@@ -567,22 +725,22 @@ body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(-
   <span class="stats" id="stats"></span>
 </div>
 <div id="timeline-controls">
-  <button id="btn-reset">Reset Zoom</button>
-  <button id="btn-zoom-sel">Zoom to Selection</button>
+  <button id="btn-reset">reset zoom</button>
+  <button id="btn-zoom-sel">zoom to selection</button>
   <span id="selection-info">Click and drag on timeline to select a region</span>
 </div>
 <div id="timeline-container">
   <canvas id="timeline-canvas"></canvas>
-  <div id="selection-overlay"><span id="sel-t-start" style="position:absolute;bottom:2px;left:3px;font-size:9px;font-family:monospace;color:#e0e0e0;white-space:nowrap;background:rgba(20,20,20,0.8);padding:0 2px"></span><span id="sel-t-end" style="position:absolute;bottom:2px;right:3px;font-size:9px;font-family:monospace;color:#e0e0e0;white-space:nowrap;background:rgba(20,20,20,0.8);padding:0 2px"></span></div>
+  <div id="selection-overlay"><span id="sel-t-start" style="position:absolute;bottom:2px;left:3px;font-size:9px;color:#e0e0e0;white-space:nowrap;background:rgba(20,20,20,0.8);padding:0 2px"></span><span id="sel-t-end" style="position:absolute;bottom:2px;right:3px;font-size:9px;color:#e0e0e0;white-space:nowrap;background:rgba(20,20,20,0.8);padding:0 2px"></span></div>
 </div>
 <div id="timeline-resize-handle"></div>
 <div class="section-header">
-  <button id="btn-toggle-aborts">▼ Trace List</button>
+  <button id="btn-toggle-aborts">▼ trace list</button>
 </div>
 <div id="trace-panel" class="open"></div>
 <div id="trace-panel-resize-handle"></div>
 <div class="section-header">
-  <button id="btn-toggle-fg">▼ Flamegraph</button>
+  <button id="btn-toggle-fg">▼ flamegraph</button>
 </div>
 <div id="flamegraph-container" class="open">
   <div id="fg-section-filter"></div>
@@ -592,11 +750,41 @@ body { font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; background: var(-
 <div id="tooltip"></div>
 
 <script>
-// --- Data injected by Lua ---
-const EVENTS = %EVENTS_JSON%;
-const TOTAL_TIME = %TOTAL_TIME%;
+// --- Data accumulator & decoder ---
+var _S=[],_E=[];
+function _C(s,e){for(var i=0;i<s.length;i++)_S.push(s[i]);for(var i=0;i<e.length;i++)_E.push(e[i]);}
+function _decode(S,E){
+  var events=[];
+  for(var i=0;i<E.length;i++){
+    var d=E[i],type=S[d[0]],ev;
+    if(type==='sample'){
+      var frames=d[2],stack='';
+      for(var j=0;j<frames.length;j++){if(j>0)stack+='\n';stack+=S[frames[j]];}
+      ev={type:type,time:d[1],stack:stack,sample_count:d[3],vm_state:S[d[4]],section_path:S[d[5]]};
+    }else if(type==='section_start'||type==='section_end'){
+      ev={type:type,time:d[1],name:S[d[2]],section_path:S[d[3]]};
+    }else if(type==='trace_start'){
+      ev={type:type,time:d[1],id:d[2],parent_id:d[3],exit_id:d[4],depth:d[5],func_info:S[d[6]]};
+    }else if(type==='trace_stop'){
+      ev={type:type,time:d[1],id:d[2],func_info:S[d[3]],linktype:S[d[4]],link_id:d[5],ir_count:d[6],exit_count:d[7]};
+    }else if(type==='trace_abort'){
+      ev={type:type,time:d[1],id:d[2],abort_code:d[3],abort_reason:S[d[4]],func_info:S[d[5]]};
+    }else if(type==='trace_flush'){
+      ev={type:type,time:d[1]};
+    }else{
+      ev={type:type,time:d[1]};
+    }
+    events.push(ev);
+  }
+  return events;
+}
+document.addEventListener('DOMContentLoaded', function() {
+const EVENTS = _decode(_S, _E);
+_S = null; _E = null;
+const TOTAL_TIME = EVENTS.length > 1 ? EVENTS[EVENTS.length-1].time - EVENTS[0].time : 0;
 const TITLE = %TITLE_JSON%;
 const ROOT_PATH = %ROOT_PATH_JSON%;
+const FILE_URL_TEMPLATE = %FILE_URL_JSON%;
 // --- File link helper ---
 function funcInfoLink(fi, label) {
   if (!fi) return label || '?';
@@ -606,7 +794,7 @@ function funcInfoLink(fi, label) {
   if (!m) return display;
   const [, filePath, line] = m;
   const absPath = filePath.startsWith('/') ? filePath : ROOT_PATH + '/' + filePath;
-  const href = `vscode://file/${absPath}:${line}:1`;
+  const href = FILE_URL_TEMPLATE.replace(/\$\{path\}/g, absPath).replace(/\$\{line\}/g, line);
   return `<a class="loc-link" href="${href}">${display}</a>`;
 }
 
@@ -667,11 +855,11 @@ const VM_STATE_COLORS = {
   'J': COLORS.jit,    // JIT compile
 };
 const VM_STATE_LABELS = {
-  'N': 'Native',
-  'I': 'Interpreter',
-  'C': 'C code',
-  'G': 'GC pause',
-  'J': 'JIT compile',
+  'N': 'native',
+  'I': 'interpreter',
+  'C': 'c',
+  'G': 'gc',
+  'J': 'jit',
 };
 
 function sampleColor(e) {
@@ -722,19 +910,33 @@ function buildSectionFilter() {
   for (const name of ALL_SECTIONS) {
     const isOther = name === SECTION_OTHER;
     const label = document.createElement('label');
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = enabledSections.has(name);
-    cb.addEventListener('change', () => {
-      if (cb.checked) enabledSections.add(name);
-      else enabledSections.delete(name);
+    const isEnabled = enabledSections.has(name);
+    
+    // Custom checkbox span
+    const cbSpan = document.createElement('span');
+    cbSpan.className = 'custom-cb';
+    cbSpan.textContent = isEnabled ? '☑' : '☐';
+    if (!isEnabled) label.style.color = '#888';
+    label.appendChild(cbSpan);
+
+    label.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      if (enabledSections.has(name)) {
+        enabledSections.delete(name);
+        cbSpan.textContent = '☐';
+        label.style.color = '#888';
+      } else {
+        enabledSections.add(name);
+        cbSpan.textContent = '☑';
+        label.style.color = '';
+      }
       scheduleFlamegraph(selStart, selEnd);
     });
+
     if (!isOther) {
       label.addEventListener('mouseenter', () => { hoveredSection = name; drawTimeline(); });
       label.addEventListener('mouseleave', () => { hoveredSection = null; drawTimeline(); });
     }
-    label.appendChild(cb);
     label.appendChild(document.createTextNode(isOther ? 'other' : name));
     wrap.appendChild(label);
   }
@@ -770,15 +972,7 @@ function scheduleFlamegraph(lo, hi) {
 }
 
 // --- Stats ---
-const counts = {};
-const vmCounts = {};
-for (const e of EVENTS) {
-  counts[e.type] = (counts[e.type] || 0) + 1;
-  if (e.type === 'sample' && e.vm_state) vmCounts[e.vm_state] = (vmCounts[e.vm_state] || 0) + 1;
-}
-document.getElementById('stats').textContent =
-  `${EVENTS.length} events | ${TOTAL_TIME.toFixed(3)}s total | ` +
-  Object.entries(counts).map(([k,v]) => `${v} ${k}`).join(', ');
+document.getElementById('stats').textContent = `${EVENTS.length} events | ${TOTAL_TIME.toFixed(3)}s total`;
 
 // --- VM Pie Chart ---
 const VM_STATE_ORDER = ['N','I','C','G','J'];
@@ -849,7 +1043,10 @@ function drawVmPie(lo, hi) {
     ctx.globalAlpha = 1;
   }
 
+  // Punch out the center for the donut hole
   ctx.fillStyle = COLORS.bgPanel;
+  ctx.beginPath();
+  ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
   ctx.fill();
 
   // Center label: hovered state key or total count
@@ -860,10 +1057,10 @@ function drawVmPie(lo, hi) {
     const pct = (cnt / total * 100).toFixed(0) + '%';
     const stateColor = VM_STATE_COLORS[pieHoveredState] || COLORS.textMuted;
     // Background pill behind labels
-    const bgW = innerR * 1.5, bgH = innerR * 0.9;
+    const bgW = innerR * 1.7, bgH = innerR * 1.25;
     ctx.fillStyle = COLORS.bgDeep;
     ctx.beginPath();
-    ctx.roundRect(cx - bgW / 2, cy - bgH / 2, bgW, bgH, 4);
+    ctx.roundRect(cx - bgW / 2, cy - bgH / 2, bgW, bgH, 5);
     ctx.fill();
     ctx.fillStyle = stateColor;
     ctx.font = 'bold 9px monospace';
@@ -967,8 +1164,8 @@ function buildTraceListPanel(tStart, tEnd) {
     html += ' <button id="btn-clear-selection" style="margin-left:6px;font-size:10px;padding:1px 7px">Clear</button>';
   }
   html += '</div><div id="filter-panel"></div></div>';
-  html += '<table><tr>' + hdr('id','ID') + hdr('status','Status') + hdr('depth','Depth') + hdr('location','Location') +
-    '<th>Parent</th>' + hdr('time','Time') + '<th>IR</th><th>Exits</th></tr>';
+  html += '<table><tr>' + hdr('id','id') + hdr('status','status') + hdr('depth','depth') + hdr('location','location') +
+    '<th>parent</th>' + hdr('time','time') + '<th>ir</th><th>exits</th></tr>';
   for (const s of visible) {
     const cls = traceStatusClass(s);
     const irCount = s.end.ir_count || '';
@@ -1051,7 +1248,7 @@ document.getElementById('btn-toggle-aborts').addEventListener('click', () => {
   const btn = document.getElementById('btn-toggle-aborts');
   const rh = document.getElementById('trace-panel-resize-handle');
   const isOpen = panel.classList.toggle('open');
-  btn.textContent = isOpen ? '\u25bc Trace List' : '\u25b6 Trace List';
+  btn.textContent = isOpen ? '\u25bc trace list' : '\u25b6 trace list';
   panel.style.height = isOpen ? tracePanelH + 'px' : '0px';
   rh.style.display = isOpen ? '' : 'none';
 });
@@ -1059,7 +1256,7 @@ document.getElementById('btn-toggle-fg').addEventListener('click', () => {
   const container = document.getElementById('flamegraph-container');
   const btn = document.getElementById('btn-toggle-fg');
   container.classList.toggle('open');
-  btn.textContent = container.classList.contains('open') ? '▼ Flamegraph' : '▶ Flamegraph';
+  btn.textContent = container.classList.contains('open') ? '▼ flamegraph' : '▶ flamegraph';
   if (container.classList.contains('open')) drawFlamegraph(viewStart, viewEnd);
 });
 
@@ -1176,15 +1373,17 @@ function buildFilterPanel(tStart, tEnd) {
   const noneCheckedStyle = noneSelected ? 'color:#ef6461' : 'color:#888';
 
   let html = '<div class="filter-grid">';
-  html += `<span class="filter-all-btn" id="filter-all" style="${allCheckedStyle}"><span style="font-size:13px;line-height:1">${allSelected ? '☑' : '☐'}</span> All <span class="filter-count">(${totalZoom})</span></span>`;
-  html += `<span class="filter-none-btn" id="filter-none" style="${noneCheckedStyle}"><span style="font-size:13px;line-height:1">${noneSelected ? '☑' : '☐'}</span> None</span>`;
+  html += `<span class="filter-all-btn" id="filter-all" style="${allCheckedStyle}"><span class="custom-cb">${allSelected ? '☑' : '☐'}</span> all <span class="filter-count">(${totalZoom})</span></span>`;
+  html += `<span class="filter-none-btn" id="filter-none" style="${noneCheckedStyle}"><span class="custom-cb">${noneSelected ? '☑' : '☐'}</span> none</span>`;
   categoryList.forEach(([cat, count], idx) => {
     const color = cat === 'completed' ? COLORS.ok : COLORS.abort;
-    const checked = enabledCategories.has(cat) ? 'checked' : '';
+    const isEnabled = enabledCategories.has(cat);
+    const checkedChar = isEnabled ? '☑' : '☐';
+    const checkedStyle = isEnabled ? `` : 'color:#888';
     const escaped = cat.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
     const zoomCount = zoomCategories[cat] || 0;
     const countStyle = zoomCount === 0 ? `color:${COLORS.borderStrong}` : `color:${COLORS.textFaint}`;
-    html += `<label style="${zoomCount === 0 ? 'opacity:0.5' : ''}"><input type="checkbox" data-cat-idx="${idx}" ${checked}><span style="color:${color}">■</span> ${escaped} <span class="filter-count" style="${countStyle}">(${zoomCount})</span></label>`;
+    html += `<label style="${zoomCount === 0 ? 'opacity:0.5' : ''}; ${checkedStyle}" data-cat-idx="${idx}"><span class="custom-cb">${checkedChar}</span> <span style="color:${color}">■</span> ${escaped} <span class="filter-count" style="${countStyle}">(${zoomCount})</span></label>`;
   });
   html += '</div>';
   panel.innerHTML = html;
@@ -1194,15 +1393,21 @@ function buildFilterPanel(tStart, tEnd) {
     const noneSel = enabledCategories.size === 0;
     const allBtn = document.getElementById('filter-all');
     const noneBtn = document.getElementById('filter-none');
-    if (allBtn) { allBtn.style.color = allSel ? COLORS.ok : COLORS.textDim; allBtn.querySelector('span').textContent = allSel ? '\u2611' : '\u2610'; }
-    if (noneBtn) { noneBtn.style.color = noneSel ? COLORS.abort : COLORS.textDim; noneBtn.querySelector('span').textContent = noneSel ? '\u2611' : '\u2610'; }
+    if (allBtn) { allBtn.style.color = allSel ? COLORS.ok : COLORS.textDim; allBtn.querySelector('.custom-cb').textContent = allSel ? '☑' : '☐'; }
+    if (noneBtn) { noneBtn.style.color = noneSel ? COLORS.abort : COLORS.textDim; noneBtn.querySelector('.custom-cb').textContent = noneSel ? '☑' : '☐'; }
   }
 
-  panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
-    cb.addEventListener('change', () => {
-      const cat = categoryList[parseInt(cb.dataset.catIdx)][0];
-      if (cb.checked) enabledCategories.add(cat);
-      else enabledCategories.delete(cat);
+  panel.querySelectorAll('label[data-cat-idx]').forEach(label => {
+    label.addEventListener('click', () => {
+      const idx = parseInt(label.dataset.catIdx);
+      const cat = categoryList[idx][0];
+      if (enabledCategories.has(cat)) enabledCategories.delete(cat);
+      else enabledCategories.add(cat);
+      
+      const isEnabled = enabledCategories.has(cat);
+      label.querySelector('.custom-cb').textContent = isEnabled ? '☑' : '☐';
+      label.style.color = isEnabled ? '' : '#888';
+
       drawTimeline();
       syncFilterButtonStyles();
       schedulePanelUpdate(lo, hi);
@@ -1571,11 +1776,11 @@ function drawTimeline() {
     }
     // VM state legend — bottom-center of vm state area
     const vmItems = [
-      {color: COLORS.ok,    label: 'Native (N)'},
-      {color: COLORS.stitch,label: 'Interp (I)'},
-      {color: COLORS.linked,label: 'C (C)'},
-      {color: COLORS.abort, label: 'GC (G)'},
-      {color: COLORS.jit,   label: 'JIT compile (J)'},
+      {color: COLORS.ok,    label: 'native'},
+      {color: COLORS.stitch,label: 'interpreter'},
+      {color: COLORS.linked,label: 'c'},
+      {color: COLORS.abort, label: 'gc'},
+      {color: COLORS.jit,   label: 'jit'},
     ];
     drawInlineLegend(vmItems, w / 2, sampleH - 4);
     // Trace type legend — center of root trace lane (lane 0)
@@ -1693,7 +1898,7 @@ function formatSpanTooltip(span) {
     s += `<b style="color:${COLORS.abort}">Trace #${span.id} aborted</b>  <span style="color:${COLORS.textDimmer}">${t0}s</span>  ${dStr}`;
     s += `\n<span style="color:${COLORS.abort}">${span.end.abort_reason || '?'}</span>`;
   }
-  if (span.start.func_info) s += `\n📍 ${funcInfoLink(span.start.func_info)}`;
+  if (span.start.func_info) s += `\n ${funcInfoLink(span.start.func_info)}`;
   if (span.start.parent_id) s += `\n↑ parent #${span.start.parent_id} (exit ${span.start.exit_id})`;
   if (span.end.func_info && span.end.func_info !== span.start.func_info) s += `\n   → ${funcInfoLink(span.end.func_info)}`;
   const kids = childrenOf[span.id];
@@ -1839,7 +2044,7 @@ window.addEventListener('mousemove', (ev) => {
     viewStart = Math.max(0, newStart);
     viewEnd = Math.min(timeDuration, newEnd);
     selStart = viewStart; selEnd = viewEnd;
-    document.getElementById('selection-info').textContent = `Selected: ${(viewEnd - viewStart).toFixed(4)}s (${viewStart.toFixed(4)}s \u2014 ${viewEnd.toFixed(4)}s)`;
+    document.getElementById('selection-info').textContent = `selected: ${(viewEnd - viewStart).toFixed(4)}s (${viewStart.toFixed(4)}s \u2014 ${viewEnd.toFixed(4)}s)`;
     drawTimeline();
     updateSelOverlay();
     scheduleFlamegraph(viewStart, viewEnd);
@@ -1859,7 +2064,7 @@ window.addEventListener('mouseup', () => {
         lo = viewStart; hi = viewEnd;
       }
       const info = document.getElementById('selection-info');
-      info.textContent = `Selected: ${(hi - lo).toFixed(4)}s (${lo.toFixed(4)}s \u2014 ${hi.toFixed(4)}s)`;
+      info.textContent = `selected: ${(hi - lo).toFixed(4)}s (${lo.toFixed(4)}s \u2014 ${hi.toFixed(4)}s)`;
       updateSelOverlay();
       drawFlamegraph(lo, hi);
     }
@@ -1905,7 +2110,7 @@ function updateSelOverlay() {
 document.getElementById('btn-reset').addEventListener('click', () => {
   viewStart = 0; viewEnd = timeDuration;
   selStart = 0; selEnd = timeDuration;
-  document.getElementById('selection-info').textContent = `Selected: ${timeDuration.toFixed(4)}s (0.0000s \u2014 ${timeDuration.toFixed(4)}s)`;
+  document.getElementById('selection-info').textContent = `selected: ${timeDuration.toFixed(4)}s (0.0000s \u2014 ${timeDuration.toFixed(4)}s)`;
   drawTimeline();
   updateSelOverlay();
   drawFlamegraph(0, timeDuration);
@@ -1918,7 +2123,7 @@ document.getElementById('btn-zoom-sel').addEventListener('click', () => {
     if (hi - lo > 0.0001) {
       viewStart = lo; viewEnd = hi;
       selStart = viewStart; selEnd = viewEnd;
-      document.getElementById('selection-info').textContent = `Selected: ${(viewEnd - viewStart).toFixed(4)}s (${viewStart.toFixed(4)}s \u2014 ${viewEnd.toFixed(4)}s)`;
+      document.getElementById('selection-info').textContent = `selected: ${(viewEnd - viewStart).toFixed(4)}s (${viewStart.toFixed(4)}s \u2014 ${viewEnd.toFixed(4)}s)`;
       drawTimeline();
       updateSelOverlay();
       drawFlamegraph(viewStart, viewEnd);
@@ -1937,7 +2142,7 @@ tlCanvas.addEventListener('wheel', (ev) => {
   viewEnd = Math.min(timeDuration, newEnd);
   // Keep selection in sync with view
   selStart = viewStart; selEnd = viewEnd;
-  document.getElementById('selection-info').textContent = `Selected: ${(viewEnd - viewStart).toFixed(4)}s (${viewStart.toFixed(4)}s \u2014 ${viewEnd.toFixed(4)}s)`;
+  document.getElementById('selection-info').textContent = `selected: ${(viewEnd - viewStart).toFixed(4)}s (${viewStart.toFixed(4)}s \u2014 ${viewEnd.toFixed(4)}s)`;
   // Canvas redraws immediately; panels + flamegraph are debounced to avoid
   // rebuilding expensive DOM on every wheel tick.
   drawTimeline();
@@ -2231,104 +2436,16 @@ vmPieCanvas.addEventListener('mouseleave', () => {
 });
 
 window.addEventListener('resize', () => { invalidateTlRect(); drawTimeline(); updateSelOverlay(); drawFlamegraph(viewStart, viewEnd); drawVmPie(selStart, selEnd); });
-document.getElementById('selection-info').textContent = `Selected: ${timeDuration.toFixed(4)}s (0.0000s \u2014 ${timeDuration.toFixed(4)}s)`;
+document.getElementById('selection-info').textContent = `selected: ${timeDuration.toFixed(4)}s (0.0000s \u2014 ${timeDuration.toFixed(4)}s)`;
 drawTimeline();
 updateSelOverlay();
 drawFlamegraph(0, timeDuration);
 drawVmPie(0, timeDuration);
 buildSectionFilter();
+}); // end DOMContentLoaded
 </script>
 </body>
 </html>
 ]==]
 
-	function profile_html.export(path, events, count, total_time, title)
-		title = title or "profile"
-		local json = events_to_json(events, count)
-		local html = HTML_TEMPLATE
-		html = html:gsub("%%TITLE%%", title)
-		html = html:gsub("%%TITLE_JSON%%", json_string(title))
-		html = html:gsub("%%EVENTS_JSON%%", function()
-			return json
-		end)
-		html = html:gsub("%%TOTAL_TIME%%", string.format("%.6f", total_time))
-		html = html:gsub("%%ROOT_PATH_JSON%%", function()
-			return json_string((os.getenv("PWD") or ""):gsub("[\\/]+$", ""))
-		end)
-		local f = assert(io.open(path, "w"))
-		f:write(html)
-		f:close()
-	end
-end
-
-local profile_stop
-local trace_tracker
-local profiler = {}
-local time_start
-local profile_id
-
-function profiler.Start(id)
-	id = id or "global"
-	profile_id = id
-	time_start = get_time()
-	profile_events.reset()
-	trace_tracker = TraceTrack.New()
-
-	if trace_tracker then trace_tracker:Start() end
-
-	profile_stop = jit_profiler.Start()
-end
-
-function profiler.Stop()
-	if profile_stop then
-		profile_stop()
-		profile_stop = nil
-	end
-
-	if trace_tracker then
-		trace_tracker:Stop()
-		trace_tracker = nil
-	end
-
-	-- Final flush of any remaining events
-	profile_events.check_flush()
-	local events, count = profile_events.get_events()
-	local total_time = get_time() - time_start
-	profile_html.export(
-		"profile_summary_" .. profile_id .. ".html",
-		events,
-		count,
-		total_time,
-		profile_id
-	)
-	return {
-		events = events,
-		total_time = total_time,
-	}
-end
-
-local simple_times = {}
-local simple_stack = {}
-
-function profiler.StartSection(name--[[#: string]])
-	simple_times[name] = simple_times[name] or {total = 0}
-	simple_times[name].time = get_time()
-	table.insert(simple_stack, name)
-	jit_profiler.StartSection(name)
-end
-
-function profiler.StopSection()
-	local name = table.remove(simple_stack)
-	simple_times[name].total = simple_times[name].total + (get_time() - simple_times[name].time)
-	jit_profiler.StopSection()
-end
-
-function profiler.GetSimpleSections()
-	return simple_times
-end
-
-function profiler.GetEvents()
-	return profile_events.get_events()
-end
-
-return profiler
+return {New = profiler_new}

@@ -74,7 +74,7 @@ end
 -- ----------------------------------------------------------------------------
 -- Main Loop
 -- ----------------------------------------------------------------------------
-local N = tonumber(arg and arg[1]) or 30000 -- Default size (NxN pixels)
+local N = tonumber(arg and arg[1]) or 10000 -- Default size (NxN pixels)
 local quiet = (arg and arg[2] == "quiet")
 local lower_left = vec3(-2.0, -1.0, -1.0)
 local horizontal = vec3(4.0, 0.0, 0.0)

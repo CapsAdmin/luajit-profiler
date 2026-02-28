@@ -715,7 +715,9 @@ body { background: var(--bg-base); color: #e0e0e0; overflow-x: hidden; }
 
 #fg-section-filter { display: none; }
 .section-header { padding: 0; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; align-items: stretch; flex-shrink: 0; cursor: pointer; }
-.section-header button { background: transparent; border: none; color: var(--accent); padding: 5px 16px; cursor: pointer; font-size: 12px; font-weight: 600; width: 100%; text-align: left; }
+.section-header button { background: transparent; border: none; color: var(--accent); padding: 6px 16px; cursor: pointer; font-size: 12px; font-weight: 600; width: 100%; text-align: left; display: flex; align-items: center; gap: 8px; line-height: 1.2; }
+.section-header button::before { content: '▼'; display: inline-block; width: 1.2em; text-align: center; flex-shrink: 0; transition: transform 0.1s; font-size: 10px; }
+.section-header button.collapsed::before { content: '▶'; }
 .section-header:hover button { color: #fff; background: rgba(255,255,255,0.04); }
 #trace-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; height: 0; }
 #trace-panel.open { overflow: hidden; }
@@ -789,7 +791,7 @@ body { background: var(--bg-base); color: #e0e0e0; overflow-x: hidden; }
   </div>
 </div>
 <div class="section-header">
-  <button id="btn-toggle-samples">▼ samples</button>
+  <button id="btn-toggle-samples">samples</button>
 </div>
 <div id="sample-filter-panel" class="open"></div>
 <div id="timeline-container" class="open">
@@ -805,12 +807,12 @@ body { background: var(--bg-base); color: #e0e0e0; overflow-x: hidden; }
 </div>
 <div id="timeline-resize-handle" class="resize-handle"></div>
 <div class="section-header">
-  <button id="btn-toggle-aborts">▼ traces</button>
+  <button id="btn-toggle-aborts">traces</button>
 </div>
 <div id="trace-panel" class="open"></div>
 <div id="trace-panel-resize-handle" class="resize-handle"></div>
 <div class="section-header">
-  <button id="btn-toggle-fg">▼ flamegraph</button>
+  <button id="btn-toggle-fg">flamegraph</button>
 </div>
 <div id="flamegraph-container" class="open">
   <div id="fg-section-filter"></div>
@@ -1504,8 +1506,7 @@ document.getElementById('btn-toggle-samples').addEventListener('click', () => {
   const btn = document.getElementById('btn-toggle-samples');
   const isOpen = container.classList.toggle('open');
   panel.classList.toggle('open', isOpen);
-  ctrl.classList.toggle('open', isOpen);
-  btn.textContent = isOpen ? '\u25bc samples' : '\u25b6 samples';
+  btn.classList.toggle('collapsed', !isOpen);
   rh.style.display = isOpen ? '' : 'none';
   if (isOpen) {
     drawTimeline();
@@ -1518,16 +1519,16 @@ document.getElementById('btn-toggle-aborts').addEventListener('click', () => {
   const btn = document.getElementById('btn-toggle-aborts');
   const rh = document.getElementById('trace-panel-resize-handle');
   const isOpen = panel.classList.toggle('open');
-  btn.textContent = isOpen ? '\u25bc traces' : '\u25b6 traces';
+  btn.classList.toggle('collapsed', !isOpen);
   panel.style.height = isOpen ? tracePanelH + 'px' : '0px';
   rh.style.display = isOpen ? '' : 'none';
 });
 document.getElementById('btn-toggle-fg').addEventListener('click', () => {
   const container = document.getElementById('flamegraph-container');
   const btn = document.getElementById('btn-toggle-fg');
-  container.classList.toggle('open');
-  btn.textContent = container.classList.contains('open') ? '▼ flamegraph' : '▶ flamegraph';
-  if (container.classList.contains('open')) drawFlamegraph(viewStart, viewEnd);
+  const isOpen = container.classList.toggle('open');
+  btn.classList.toggle('collapsed', !isOpen);
+  if (isOpen) drawFlamegraph(viewStart, viewEnd);
 });
 
 // Sync: highlight traces row when timeline hover changes

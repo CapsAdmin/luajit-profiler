@@ -24,4 +24,4 @@ end
 p:Stop()
 ```
 
-<img width="1019" height="1134" alt="image" src="https://github.com/user-attachments/assets/68a9e6c0-eb29-451e-b37d-4aaa4a18ef86" />
+<img width="812" height="1070" alt="image" src="https://github.com/user-attachments/assets/d83823d0-e312-4f67-9801-7d7eea133755" />

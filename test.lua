@@ -11,7 +11,7 @@ do
 	math.randomseed(12345)
 	local GRID_SIZE = 80
 	local NUM_ENTITIES = 500
-	local NUM_STEPS = 3000
+	local NUM_STEPS = 4600
 	local TYPES = {"warrior", "archer", "healer", "scout"}
 	-- Intentionally uses string keys: easy to optimize to y*GRID_SIZE+x
 	local grid = {}
@@ -108,6 +108,9 @@ do
 					best_dist = d
 					best_x = n.x
 					best_y = n.y
+
+					-- trace stitch
+					if tostring(best_y):gsub("%d", "") == "7" then best_x = best_x + 0 end
 				end
 			end
 		end
@@ -384,15 +387,29 @@ do
 			file_url = "vscode://file/" .. os.getenv("PWD") .. "/${path}:${line}:1",
 		}
 	)
+	local HALF = math.floor(NUM_STEPS / 2)
 
 	-- Main simulation loop
 	for step = 1, NUM_STEPS do
+		p:StartSection("update")
+
 		for _, entity in ipairs(entities) do
 			update_entity(entity, step)
 		end
 
+		p:StopSection()
+
+		-- Explicit trace flush at midpoint: forces JIT to recompile everything
+		if step == HALF then
+			p:StartSection("flush")
+			jit.flush()
+			p:StopSection()
+		end
+
 		-- Respawn dead entities periodically to keep simulation busy
 		if step % 50 == 0 then
+			p:StartSection("respawn")
+
 			for _, entity in pairs(entities) do
 				if entity.hp <= 0 then
 					entity.hp = 100
@@ -404,9 +421,15 @@ do
 					grid_set(grid, entity.x, entity.y, entity)
 				end
 			end
+
+			p:StopSection()
 		end
 
-		if step % 10 == 0 then log_state(step) end
+		if step % 10 == 0 then
+			p:StartSection("logging")
+			log_state(step)
+			p:StopSection()
+		end
 	end
 
 	p:Stop()

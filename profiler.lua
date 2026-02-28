@@ -181,6 +181,7 @@ type Profiler.@SelfArgument = {
 	_section_path = string,
 	_traces = List<|{id = number, parent_id = number | nil, exit_id = number | nil, depth = number}|>,
 	_trace_count = number,
+	_trace_generation = number,
 	_aborted = List<|boolean|>,
 	_should_warn_mcode = function=()>(number | false, number | nil),
 	_should_warn_abort = function=()>(number | false, number | nil),
@@ -194,9 +195,10 @@ type Profiler.@SelfArgument = {
 
 -- --- Event accumulation ---
 function Profiler:EmitEvent(event--[[#: TEvent]])
-	self._event_count = self._event_count + 1
 	event.time = self._get_time()
-	self._events[self._event_count] = event
+	local idx = self._event_count + 1
+	self._events[idx] = event
+	self._event_count = idx
 end
 
 -- --- Section tracking ---
@@ -244,6 +246,7 @@ do
 			{
 				type = "trace_start",
 				id = id,
+				generation = self._trace_generation,
 				parent_id = parent_id,
 				exit_id = exit_id,
 				depth = depth,
@@ -264,6 +267,7 @@ do
 			{
 				type = "trace_stop",
 				id = id,
+				generation = self._trace_generation,
 				func_info = loc,
 				linktype = ti and ti.linktype or nil,
 				link_id = ti and ti.link or nil,
@@ -294,6 +298,7 @@ do
 			{
 				type = "trace_abort",
 				id = id,
+				generation = self._trace_generation,
 				abort_code = code,
 				abort_reason = format_error(code, reason),
 				func_info = loc,
@@ -332,6 +337,7 @@ do
 		self._aborted = {}
 		self._trace_count = 0
 		self:EmitEvent({type = "trace_flush"})
+		self._trace_generation = self._trace_generation + 1
 	end
 
 	-- --- Constructor ---
@@ -381,6 +387,7 @@ do
 		-- Trace tracking
 		self._traces = {}
 		self._trace_count = 0
+		self._trace_generation = 0
 		self._aborted = {}
 		self._should_warn_mcode = create_warn_log(2)
 		self._should_warn_abort = create_warn_log(8)
@@ -518,10 +525,11 @@ do
 			)
 		elseif ev.type == "trace_start" then
 			return string_format(
-				"[%d,%.6f,%d,%s,%s,%d,%d]",
+				"[%d,%.6f,%d,%d,%s,%s,%d,%d]",
 				ti,
 				ev.time,
 				ev.id or 0,
+				ev.generation or 0,
 				ev.parent_id and tostring(ev.parent_id) or "null",
 				ev.exit_id and tostring(ev.exit_id) or "null",
 				ev.depth or 0,
@@ -529,10 +537,11 @@ do
 			)
 		elseif ev.type == "trace_stop" then
 			return string_format(
-				"[%d,%.6f,%d,%d,%d,%s,%d,%d]",
+				"[%d,%.6f,%d,%d,%d,%d,%s,%d,%d]",
 				ti,
 				ev.time,
 				ev.id or 0,
+				ev.generation or 0,
 				intern(self, ev.func_info),
 				intern(self, ev.linktype),
 				ev.link_id and tostring(ev.link_id) or "null",
@@ -541,10 +550,11 @@ do
 			)
 		elseif ev.type == "trace_abort" then
 			return string_format(
-				"[%d,%.6f,%d,%s,%d,%d]",
+				"[%d,%.6f,%d,%d,%s,%d,%d]",
 				ti,
 				ev.time,
 				ev.id or 0,
+				ev.generation or 0,
 				ev.abort_code and tostring(ev.abort_code) or "null",
 				intern(self, ev.abort_reason),
 				intern(self, ev.func_info)
@@ -641,7 +651,7 @@ HTML_TEMPLATE = [==[
   --bg-panel:    #222;
   --bg-elevated: #2a2a2a;
   --bg-hover:    #383838;
-  --border:      #333;
+  --border:      #3030306c;
   --border-strong:#444;
   --text-muted:  #888;
   --text-dim:    #666;
@@ -653,42 +663,73 @@ HTML_TEMPLATE = [==[
   --color-select:#ffc832;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'SF Mono', 'Consolas', 'Menlo', monospace; }
-body { background: var(--bg-base); color: #e0e0e0; }
+body { background: var(--bg-base); color: #e0e0e0; overflow-x: hidden; }
+
+/* Custom Scrollbars */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--bg-elevated); border: 2px solid var(--bg-base); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--bg-hover); }
+::-webkit-scrollbar-corner { background: var(--bg-base); }
+
 #header { padding: 8px 16px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-#header .stats { font-size: 12px; color: var(--text-muted); }
-#timeline-container { position: relative; background: #141414; border-bottom: none; overflow: hidden; cursor: crosshair; }
+#header .stats { font-size: 13px; color: var(--text-muted); line-height: 1.4; }
+#header .stats b { color: #fff; }
+#timeline-container { position: relative; background: #141414; border-bottom: none; cursor: crosshair; flex-shrink: 0; display: none; }
+#timeline-container.open { display: block; }
 #timeline-canvas { width: 100%; height: 100%; }
 .resize-handle { height: 7px; background: var(--bg-panel); border-bottom: 1px solid var(--border); cursor: ns-resize; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .resize-handle::after { content: ''; width: 40px; height: 2px; background: var(--border-strong); border-radius: 1px; }
 .resize-handle:hover::after, .resize-handle.dragging::after { background: var(--accent); }
-#selection-overlay { position: absolute; top: 0; background: var(--accent-dim); border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); pointer-events: none; display: none; overflow: visible; }
+#selection-overlay { position: absolute; top: 0; bottom: 0; background: var(--accent-dim); border-left: 1px solid var(--accent); border-right: 1px solid var(--accent); pointer-events: none; display: none; overflow: visible; z-index: 10; }
+#selection-overlay::before, #selection-overlay::after { content: ''; position: absolute; top: 0; width: 1px; height: 100%; background: var(--accent); }
+#selection-overlay::before { left: -1px; }
+#selection-overlay::after { right: -1px; }
+.sel-pin { position: absolute; top: -4px; width: 7px; height: 7px; background: var(--text-muted); transform: translateX(-50%) rotate(45deg); border: 1px solid var(--bg-base); }
+.sel-pin.left { left: 0; }
+.sel-pin.right { left: 100%; }
 
-#timeline-controls { padding: 6px 16px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+#timeline-controls { padding: 6px 16px; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: center; font-size: 12px; flex-wrap: wrap; display: none; }
+#timeline-controls.open { display: flex; }
 .panel-btn { background: var(--bg-elevated); border: 1px solid var(--border-strong); color: #ccc; padding: 4px 12px; border-radius: 3px; cursor: pointer; font-size: 11px; }
 .panel-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
 .sel-star { font-size: 10px; color: var(--color-select); margin-left: 8px; }
 .btn-clear { margin-left: 6px; font-size: 10px; padding: 1px 7px; }
-.sel-time-label { position: absolute; bottom: 2px; font-size: 9px; color: #e0e0e0; white-space: nowrap; background: rgba(20,20,20,0.8); padding: 0 2px; }
+.sel-time-label { position: absolute; top: 0; font-size: 10px; font-weight: bold; color: var(--text-muted); white-space: nowrap; background: var(--bg-base); border: 1px solid var(--border-strong); padding: 1px 4px; border-radius: 3px; z-index: 100; box-shadow: 0 2px 4px rgba(0,0,0,0.5); pointer-events: none; }
 .empty-msg { padding: 12px; color: var(--text-dim); }
 #selection-info { color: var(--text-muted); }
-#fg-section-filter { background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 6px 16px; display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; font-size: 11px; }
-#fg-section-filter label { display: flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; color: var(--text-muted); padding: 2px 0; }
-#fg-section-filter label:hover { color: var(--accent); }
-#fg-section-filter label input { accent-color: var(--accent); cursor: pointer; }
+#sample-filter-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); overflow: visible; display: none; }
+#sample-filter-panel.open { display: block; }
+
+#fg-section-filter { display: none; }
 .section-header { padding: 0; background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; align-items: stretch; flex-shrink: 0; cursor: pointer; }
 .section-header button { background: transparent; border: none; color: var(--accent); padding: 5px 16px; cursor: pointer; font-size: 12px; font-weight: 600; width: 100%; text-align: left; }
 .section-header:hover button { color: #fff; background: rgba(255,255,255,0.04); }
-#trace-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); overflow: hidden; height: 0; }
-#trace-panel.open { overflow: auto; }
+#trace-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; height: 0; }
+#trace-panel.open { overflow: hidden; }
 
-#trace-sticky-top { position: sticky; top: 0; z-index: 2; background: var(--bg-panel); }
+#trace-sticky-top { position: sticky; top: 0; z-index: 2; background: var(--bg-panel); flex-shrink: 0; padding-right: 10px; /* Match standard scrollbar width */ }
 #trace-filter-header { padding: 6px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
 #trace-filter-header:empty { display: none; }
 #trace-filter-header .panel-btn { padding: 2px 10px; }
-#trace-panel table { width: 100%; border-collapse: collapse; font-size: 11px; }
-#trace-panel th { position: sticky; z-index: 2; background: var(--bg-elevated); padding: 6px 10px; text-align: left; color: var(--accent); border-bottom: 1px solid var(--border-strong); font-weight: 600; cursor: pointer; user-select: none; }
+#trace-panel-scroll { flex: 1; overflow: auto; position: relative; }
+#trace-panel table { width: 100%; border-collapse: collapse; font-size: 11px; table-layout: fixed; margin: 0; padding: 0; border: none; }
+#trace-panel .trace-header { background: var(--bg-elevated); table-layout: fixed; width: 100%; border: none; }
+#trace-panel th, #trace-panel td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border-strong); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-sizing: border-box; }
+#trace-panel th { color: var(--accent); font-weight: 600; cursor: pointer; user-select: none; position: relative; }
 #trace-panel th:hover { color: #fff; }
-#trace-panel td { padding: 4px 10px; border-bottom: 1px solid var(--bg-panel); }
+#trace-panel th .th-resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 5px; cursor: col-resize; user-select: none; z-index: 10; border-right: 1px solid var(--border-strong); }
+#trace-panel th .th-resizer:hover { border-right-color: var(--accent); }
+#trace-panel td { border-bottom: 1px solid var(--bg-panel); }
+#trace-panel .col-id { width: 60px; }
+#trace-panel .col-status { width: 140px; }
+#trace-panel .col-depth { width: 45px; }
+#trace-panel .col-location { width: auto; }
+#trace-panel .col-parent { width: 120px; }
+#trace-panel .col-time { width: 100px; }
+#trace-panel .col-ir { width: 50px; }
+#trace-panel .col-exits { width: 60px; }
+#trace-panel thead tr th:last-child .th-resizer { display: none; }
 #trace-panel tr.trace-row { cursor: pointer; }
 #trace-panel tr.trace-row:hover td, #trace-panel tr.trace-row.hovered td { background: rgba(255,255,255,0.06); }
 #trace-panel tr.trace-row.highlighted td { background: rgba(255,255,255,0.12); outline: 1px solid rgba(255,255,255,0.25); }
@@ -699,14 +740,16 @@ body { background: var(--bg-base); color: #e0e0e0; }
 .trace-abort { color: var(--color-abort); }
 .trace-location { color: #aaa; }
 .trace-id { color: #ccc; font-weight: 600; min-width: 40px; }
-#filter-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); overflow: visible; }
-#filter-panel .filter-grid { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 16px; font-size: 11px; }
-#filter-panel label { display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 2px 0; white-space: nowrap; }
-#filter-panel label:hover { color: #fff; }
-#filter-panel .filter-count { color: var(--text-dim); font-size: 10px; }
+#filter-panel, #sample-filter-panel { background: var(--bg-panel); border-bottom: 1px solid var(--border); overflow: visible; }
+#filter-panel .filter-grid, #sample-filter-panel .filter-grid { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 16px; font-size: 11px; }
+#filter-panel label, #sample-filter-panel label { display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 2px 0; white-space: nowrap; }
+#filter-panel label:hover, #sample-filter-panel label:hover { color: #fff; }
+#filter-panel label.disabled, #sample-filter-panel label.disabled { color: #888; }
+#filter-panel .filter-count, #sample-filter-panel .filter-count { color: var(--text-dim); font-size: 10px; }
 .custom-cb { font-size: 13px; line-height: 1; font-family: monospace; display: inline-block; width: 1.1em; }
-#filter-panel .filter-all-btn, #filter-panel .filter-none-btn { display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 2px 0; white-space: nowrap; font-size: 11px; user-select: none; }
-#filter-panel .filter-all-btn:hover, #filter-panel .filter-none-btn:hover { color: #fff; }
+#filter-panel .filter-all-btn, #filter-panel .filter-none-btn, #sample-filter-panel .filter-all-btn, #sample-filter-panel .filter-none-btn { display: flex; align-items: center; gap: 4px; cursor: pointer; padding: 2px 0; white-space: nowrap; font-size: 11px; user-select: none; }
+#filter-panel .filter-all-btn:hover, #filter-panel .filter-none-btn:hover, #sample-filter-panel .filter-all-btn:hover, #sample-filter-panel .filter-none-btn:hover { color: #fff; }
+.filter-separator { width: 100%; height: 1px; background: var(--border); margin: 4px 0; }
 #flamegraph-container { overflow: hidden; max-height: 0; flex-shrink: 0; }
 #flamegraph-container.open { max-height: none; display: block; overflow-x: hidden; overflow-y: auto; flex: 1; }
 #flamegraph-canvas { width: 100%; min-height: 400px; }
@@ -724,18 +767,26 @@ body { background: var(--bg-base); color: #e0e0e0; }
   <div id="vm-pie-wrap"><canvas id="vm-pie-canvas" width="72" height="72"></canvas></div>
   <span class="stats" id="stats"></span>
 </div>
-<div id="timeline-controls">
+<div class="section-header">
+  <button id="btn-toggle-samples">▼ samples</button>
+</div>
+<div id="sample-filter-panel" class="open"></div>
+<div id="timeline-controls" class="open">
   <button id="btn-reset" class="panel-btn">reset zoom</button>
   <button id="btn-zoom-sel" class="panel-btn">zoom to selection</button>
-  <span id="selection-info">Click and drag on timeline to select a region</span>
 </div>
-<div id="timeline-container">
+<div id="timeline-container" class="open">
   <canvas id="timeline-canvas"></canvas>
-  <div id="selection-overlay"><span id="sel-t-start" class="sel-time-label" style="left:3px"></span><span id="sel-t-end" class="sel-time-label" style="right:3px"></span></div>
+  <div id="selection-overlay">
+    <div class="sel-pin left"></div>
+    <div class="sel-pin right"></div>
+    <span id="sel-t-start" class="sel-time-label" style="left:0;"></span>
+    <span id="sel-t-end" class="sel-time-label" style="left:100%;"></span>
+  </div>
 </div>
 <div id="timeline-resize-handle" class="resize-handle"></div>
 <div class="section-header">
-  <button id="btn-toggle-aborts">▼ trace list</button>
+  <button id="btn-toggle-aborts">▼ traces</button>
 </div>
 <div id="trace-panel" class="open"></div>
 <div id="trace-panel-resize-handle" class="resize-handle"></div>
@@ -764,11 +815,11 @@ function _decode(S,E){
     }else if(type==='section_start'||type==='section_end'){
       ev={type:type,time:d[1],name:S[d[2]],section_path:S[d[3]]};
     }else if(type==='trace_start'){
-      ev={type:type,time:d[1],id:d[2],parent_id:d[3],exit_id:d[4],depth:d[5],func_info:S[d[6]]};
+      ev={type:type,time:d[1],id:d[2],generation:d[3],parent_id:d[4],exit_id:d[5],depth:d[6],func_info:S[d[7]]};
     }else if(type==='trace_stop'){
-      ev={type:type,time:d[1],id:d[2],func_info:S[d[3]],linktype:S[d[4]],link_id:d[5],ir_count:d[6],exit_count:d[7]};
+      ev={type:type,time:d[1],id:d[2],generation:d[3],func_info:S[d[4]],linktype:S[d[5]],link_id:d[6],ir_count:d[7],exit_count:d[8]};
     }else if(type==='trace_abort'){
-      ev={type:type,time:d[1],id:d[2],abort_code:d[3],abort_reason:S[d[4]],func_info:S[d[5]]};
+      ev={type:type,time:d[1],id:d[2],generation:d[3],abort_code:d[4],abort_reason:S[d[5]],func_info:S[d[6]]};
     }else if(type==='trace_flush'){
       ev={type:type,time:d[1]};
     }else{
@@ -882,7 +933,6 @@ let hoveredSection = null;  // section name being hovered in fg-section-filter
 let pieSlices = [];  // [{state, a0, a1}] built by drawVmPie
 let timelineContainerH = 0; // set after totalLanes is known
 
-// --- Section filter ---
 const ALL_SECTIONS = [];
 const SECTION_OTHER = '__other__';
 {
@@ -891,52 +941,141 @@ const SECTION_OTHER = '__other__';
   for (const e of EVENTS) {
     if (e.type === 'section_start') {
       const name = e.name || '';
-      if (name && !seen.has(name)) { seen.add(name); ALL_SECTIONS.push(name); }
+      if (name && !seen.has(name) && name !== SECTION_OTHER) { seen.add(name); ALL_SECTIONS.push(name); }
     }
     if (e.type === 'sample' && e.stack && !e.section_path) hasOther = true;
   }
   if (hasOther) ALL_SECTIONS.push(SECTION_OTHER);
 }
 const enabledSections = new Set(ALL_SECTIONS);
+const enabledStates = new Set(['N', 'I', 'C', 'G', 'J']);
 
-function buildSectionFilter() {
-  const wrap = document.getElementById('fg-section-filter');
-  if (!wrap) return;
-  wrap.innerHTML = '';
-  if (ALL_SECTIONS.length === 0) { wrap.style.display = 'none'; return; }
-  for (const name of ALL_SECTIONS) {
-    const isOther = name === SECTION_OTHER;
-    const label = document.createElement('label');
-    const isEnabled = enabledSections.has(name);
-    
-    // Custom checkbox span
-    const cbSpan = document.createElement('span');
-    cbSpan.className = 'custom-cb';
-    cbSpan.textContent = isEnabled ? '☑' : '☐';
-    if (!isEnabled) label.style.color = '#888';
-    label.appendChild(cbSpan);
+let hoverCategory = null;
+let hoverAbortReason = null;
+let hoverState = null;
+let hoverSection = null;
 
-    label.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      if (enabledSections.has(name)) {
-        enabledSections.delete(name);
-        cbSpan.textContent = '☐';
-        label.style.color = '#888';
-      } else {
-        enabledSections.add(name);
-        cbSpan.textContent = '☑';
-        label.style.color = '';
-      }
-      scheduleFlamegraph(selStart, selEnd);
+function buildSampleFilterPanel(lo, hi) {
+  const panel = document.getElementById('sample-filter-panel');
+  if (!panel) return;
+
+  const states = ['N', 'I', 'C', 'G', 'J'];
+  const allStatesSelected = states.every(s => enabledStates.has(s));
+  const allSectionsSelected = ALL_SECTIONS.every(s => enabledSections.has(s));
+  const allSelected = allStatesSelected && allSectionsSelected;
+  const noneSelected = enabledStates.size === 0 && enabledSections.size === 0;
+
+  let html = '<div class="filter-grid">';
+
+  // VM States
+  states.forEach(state => {
+    const isEnabled = enabledStates.has(state);
+    const color = VM_STATE_COLORS[state] || COLORS.textDim;
+    const label = VM_STATE_LABELS[state] || state;
+    html += `<label class="${isEnabled ? '' : 'disabled'}" data-state="${state}"><span class="custom-cb">${isEnabled ? '☑' : '☐'}</span> <span style="color:${color}">■</span> ${label}</label>`;
+  });
+
+  if (ALL_SECTIONS.length > 0) {
+    html += '<div class="filter-separator"></div>';
+    ALL_SECTIONS.forEach(name => {
+      const isEnabled = enabledSections.has(name);
+      html += `<label class="${isEnabled ? '' : 'disabled'}" data-section="${name}"><span class="custom-cb">${isEnabled ? '☑' : '☐'}</span> ${name === SECTION_OTHER ? 'other' : name}</label>`;
     });
-
-    if (!isOther) {
-      label.addEventListener('mouseenter', () => { hoveredSection = name; drawTimeline(); });
-      label.addEventListener('mouseleave', () => { hoveredSection = null; drawTimeline(); });
-    }
-    label.appendChild(document.createTextNode(isOther ? 'other' : name));
-    wrap.appendChild(label);
   }
+
+  html += '</div>';
+  panel.innerHTML = html;
+
+  panel.addEventListener('mouseleave', () => {
+    hoverState = null;
+    hoverSection = null;
+    hoveredSection = null;
+    drawTimeline();
+  });
+
+  panel.querySelectorAll('label[data-state]').forEach(label => {
+    label.addEventListener('click', () => {
+      const state = label.dataset.state;
+      if (enabledStates.has(state)) enabledStates.delete(state);
+      else enabledStates.add(state);
+      
+      const isEnabled = enabledStates.has(state);
+      label.querySelector('.custom-cb').textContent = isEnabled ? '☑' : '☐';
+      label.classList.toggle('disabled', !isEnabled);
+      
+      hoverState = null;
+      drawTimeline();
+      scheduleFlamegraph(lo, hi);
+      schedulePanelUpdate(lo, hi);
+    });
+    label.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const state = label.dataset.state;
+      const isSolo = enabledStates.has(state) && enabledStates.size === 1 && enabledSections.size === ALL_SECTIONS.length;
+      if (isSolo) {
+        states.forEach(s => enabledStates.add(s));
+      } else {
+        enabledStates.clear();
+        enabledStates.add(state);
+      }
+      hoverState = null;
+      drawTimeline();
+      buildSampleFilterPanel(lo, hi);
+      scheduleFlamegraph(lo, hi);
+      schedulePanelUpdate(lo, hi);
+    });
+    label.addEventListener('mouseenter', () => {
+      hoverState = label.dataset.state;
+      drawTimeline();
+    });
+    label.addEventListener('mouseleave', () => {
+      hoverState = null;
+      drawTimeline();
+    });
+  });
+  panel.querySelectorAll('label[data-section]').forEach(label => {
+    const name = label.dataset.section;
+    label.addEventListener('click', () => {
+      if (enabledSections.has(name)) enabledSections.delete(name);
+      else enabledSections.add(name);
+      
+      const isEnabled = enabledSections.has(name);
+      label.querySelector('.custom-cb').textContent = isEnabled ? '☑' : '☐';
+      label.classList.toggle('disabled', !isEnabled);
+
+      hoverSection = null;
+      hoveredSection = null;
+      drawTimeline();
+      scheduleFlamegraph(lo, hi);
+      schedulePanelUpdate(lo, hi);
+    });
+    label.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const isSolo = enabledSections.has(name) && enabledSections.size === 1 && enabledStates.size === states.length;
+      if (isSolo) {
+        ALL_SECTIONS.forEach(s => enabledSections.add(s));
+      } else {
+        enabledSections.clear();
+        enabledSections.add(name);
+      }
+      hoverSection = null;
+      hoveredSection = null;
+      drawTimeline();
+      buildSampleFilterPanel(lo, hi);
+      scheduleFlamegraph(lo, hi);
+      schedulePanelUpdate(lo, hi);
+    });
+    label.addEventListener('mouseenter', () => {
+      hoverSection = name;
+      if (name !== SECTION_OTHER) hoveredSection = name; 
+      drawTimeline(); 
+    });
+    label.addEventListener('mouseleave', () => {
+      hoverSection = null;
+      hoveredSection = null;
+      drawTimeline();
+    });
+  });
 }
 
 // Cached canvas rect — avoids forced layout reflow on every tick
@@ -951,32 +1090,70 @@ function invalidateTlRect() { tlCanvasRectCache = null; }
 // rebuilds DOM after the user pauses, keeping canvas draw synchronous.
 let panelDebounceTimer = null;
 let fgDebounceTimer = null;
+let lastPanelRangeKey = "";
+let lastFilterStateKey = "";
+
 function schedulePanelUpdate(lo, hi) {
   if (panelDebounceTimer) clearTimeout(panelDebounceTimer);
   panelDebounceTimer = setTimeout(() => {
     buildTraceListPanel(lo, hi);
     buildFilterPanel(lo, hi);
+    buildSampleFilterPanel(lo, hi);
     drawVmPie(lo, hi);
     panelDebounceTimer = null;
   }, 120);
 }
+
 function scheduleFlamegraph(lo, hi) {
   if (fgDebounceTimer) clearTimeout(fgDebounceTimer);
   fgDebounceTimer = setTimeout(() => {
     drawFlamegraph(lo, hi);
     fgDebounceTimer = null;
-  }, 120);
+  }, 10); // Reduced delay for immediate feedback
 }
 
 function refreshView(lo, hi, immediate) {
   drawTimeline();
   updateSelOverlay();
-  if (immediate) { drawFlamegraph(lo, hi); drawVmPie(lo, hi); }
-  else scheduleFlamegraph(lo, hi);
+
+  // If selection is exactly the current view (100% visible), 
+  // then filtering (flamegraph/stats/panels) should follow the zoom.
+  const isFullView = (selStart <= lo + 0.000001 && selEnd >= hi - 0.000001);
+  const filterStart = isFullView ? lo : selStart;
+  const filterEnd = isFullView ? hi : selEnd;
+
+  updateStats(filterStart, filterEnd);
+  if (immediate) {
+    drawFlamegraph(filterStart, filterEnd);
+    drawVmPie(filterStart, filterEnd);
+    buildTraceListPanel(filterStart, filterEnd);
+    buildFilterPanel(filterStart, filterEnd);
+    buildSampleFilterPanel(filterStart, filterEnd);
+  } else {
+    scheduleFlamegraph(filterStart, filterEnd);
+    schedulePanelUpdate(filterStart, filterEnd);
+  }
 }
 
 // --- Stats ---
-document.getElementById('stats').textContent = `${EVENTS.length} events | ${TOTAL_TIME.toFixed(3)}s total`;
+const statsEl = document.getElementById('stats');
+function updateStats(lo, hi) {
+  let count = 0;
+  let totalSamples = 0;
+  for (const e of EVENTS) {
+    if (e.type === 'sample') {
+      totalSamples++;
+      const t = e.time - timeOrigin;
+      if (t >= lo && t <= hi) count++;
+    }
+  }
+  const dur = hi - lo;
+  statsEl.innerHTML = `
+    <b>${count}</b> / ${totalSamples} events<br>
+    <b>${dur.toFixed(3)}</b> / ${TOTAL_TIME.toFixed(3)}s
+  `;
+}
+updateStats(0, timeDuration);
 
 // --- VM Pie Chart ---
 const VM_STATE_ORDER = ['N','I','C','G','J'];
@@ -1105,25 +1282,31 @@ function buildTraceListPanel(tStart, tEnd) {
     // Walk up to root
     let anc = selectedSpan;
     while (anc) {
-      selectedTree.add(anc.id);
-      anc = anc.start.parent_id ? spanById[anc.start.parent_id] : null;
+      selectedTree.add(anc.uid);
+      anc = anc.start.parent_id ? spanByUid[traceUid(anc.start.generation, anc.start.parent_id)] : null;
     }
     // BFS down descendants
     const q = [selectedSpan];
     while (q.length) {
       const n = q.shift();
-      selectedTree.add(n.id);
-      const kids = childrenOf[n.id];
+      selectedTree.add(n.uid);
+      const kids = childrenOfUid[n.uid];
       if (kids) for (const k of kids) q.push(k);
     }
   }
 
   const visible = [];
   for (const span of traceSpans) {
-    if (!enabledCategories.has(span.category)) continue;
+    if (hoverCategory) {
+      if (span.category !== hoverCategory) continue;
+      if (hoverCategory === 'aborted' && hoverAbortReason && span.abort_reason !== hoverAbortReason) continue;
+    } else {
+      if (!enabledCategories.has(span.category)) continue;
+      if (span.abort_reason && !enabledAbortReasons.has(span.abort_reason)) continue;
+    }
     // If a span is selected, only show its tree; otherwise filter by time range
     if (selectedTree) {
-      if (!selectedTree.has(span.id)) continue;
+      if (!selectedTree.has(span.uid)) continue;
     } else {
       const t = span.t0 - timeOrigin;
       if (t < lo || t > hi) continue;
@@ -1159,70 +1342,119 @@ function buildTraceListPanel(tStart, tEnd) {
   visible.sort(cmp);
 
   const arrow = traceListSortAsc ? ' ▲' : ' ▼';
-  const hdr = (key, label) => {
+  const hdr = (key, label, cls) => {
     const active = traceListSortKey === key;
-    return '<th data-sort="' + key + '">' + label + (active ? arrow : '') + '</th>';
+    return '<th data-sort="' + key + '" class="' + (cls || '') + '">' + label + (active ? arrow : '') + '<div class="th-resizer"></div></th>';
   };
   let html = '<div id="trace-sticky-top"><div id="trace-filter-header">';
   if (selectedSpan) {
     html += clearSelectionHtml(selectedSpan.id, 'Showing tree for #' + selectedSpan.id);
   }
-  html += '</div><div id="filter-panel"></div></div>';
-  html += '<table><tr>' + hdr('id','id') + hdr('status','status') + hdr('depth','depth') + hdr('location','location') +
-    '<th>parent</th>' + hdr('time','time') + '<th>ir</th><th>exits</th></tr>';
+  html += '</div><div id="filter-panel"></div>';
+  html += '<table class="trace-header"><thead><tr>' +
+    hdr('id','id','col-id') +
+    hdr('status','status','col-status') +
+    hdr('depth','depth','col-depth') +
+    hdr('location','location','col-location') +
+    hdr('parent', 'parent', 'col-parent') +
+    hdr('time','time','col-time') +
+    hdr('ir','ir','col-ir') +
+    hdr('exits','exits','col-exits') +
+    '</tr></thead></table></div>';
+  html += '<div id="trace-panel-scroll"><table><thead><tr style="height:0; visibility:collapse;">' +
+    '<th class="col-id"></th><th class="col-status"></th><th class="col-depth"></th><th class="col-location"></th>' +
+    '<th class="col-parent"></th><th class="col-time"></th><th class="col-ir"></th><th class="col-exits"></th>' +
+    '</tr></thead><tbody>';
   for (const s of visible) {
     const cls = traceStatusClass(s);
     const irCount = s.end.ir_count || '';
     const exitCount = s.end.exit_count || '';
     const parentInfo = s.start.parent_id ? '#' + s.start.parent_id + ' exit ' + s.start.exit_id : '';
     const t = (s.t0 - timeOrigin).toFixed(4) + 's';
-    const selCls = (selectedSpan && s.id === selectedSpan.id) ? ' selected' : '';
-    html += '<tr class="trace-row' + selCls + '" data-span-id="' + s.id + '">' +
-      '<td class="trace-id">#' + s.id + '</td>' +
-      '<td class="' + cls + '">' + traceStatusLabel(s) + '</td>' +
-      '<td>' + s.depth + '</td>' +
-      '<td class="trace-location">' + funcInfoLink(s.start.func_info) + '</td>' +
-      '<td>' + parentInfo + '</td>' +
-      '<td>' + t + '</td>' +
-      '<td>' + irCount + '</td>' +
-      '<td>' + exitCount + '</td></tr>';
+    const selCls = (selectedSpan && s.uid === selectedSpan.uid) ? ' selected' : '';
+    html += '<tr class="trace-row' + selCls + '" data-span-uid="' + s.uid + '">' +
+      '<td class="col-id">#' + s.id + '</td>' +
+      '<td class="' + cls + ' col-status">' + traceStatusLabel(s) + '</td>' +
+      '<td class="col-depth">' + s.depth + '</td>' +
+      '<td class="trace-location col-location">' + funcInfoLink(s.start.func_info) + '</td>' +
+      '<td class="col-parent">' + parentInfo + '</td>' +
+      '<td class="col-time">' + t + '</td>' +
+      '<td class="col-ir">' + irCount + '</td>' +
+      '<td class="col-exits">' + exitCount + '</td></tr>';
   }
-  html += '</table>';
+  html += '</tbody></table></div>';
   container.innerHTML = html;
 
   buildFilterPanel(lo, hi);
   wireClearBtn(lo, hi);
-  // Keep th top in sync with sticky wrapper height
-  const stickyTop = document.getElementById('trace-sticky-top');
-  if (stickyTop) {
-    const topH = stickyTop.offsetHeight;
-    container.querySelectorAll('th').forEach(th => { th.style.top = topH + 'px'; });
-  }
 
   // Sort header click handlers
   container.querySelectorAll('th[data-sort]').forEach(th => {
-    th.addEventListener('click', () => {
+    th.addEventListener('click', (ev) => {
+      if (ev.target.classList.contains('th-resizer')) return;
       const key = th.dataset.sort;
       if (traceListSortKey === key) traceListSortAsc = !traceListSortAsc;
       else { traceListSortKey = key; traceListSortAsc = true; }
       buildTraceListPanel(lo, hi);
     });
+
+    const resizer = th.querySelector('.th-resizer');
+    if (resizer) {
+      resizer.addEventListener('mousedown', (ev) => {
+        ev.stopPropagation();
+        const startX = ev.clientX;
+        const startW = th.getBoundingClientRect().width;
+        
+        const onMouseMove = (moveEv) => {
+          const newW = Math.max(30, startW + (moveEv.clientX - startX));
+          const cls = th.className.split(' ').find(c => c.startsWith('col-'));
+          if (cls) {
+            // Find or create style tag for dynamic resizing
+            let styleTag = document.getElementById('dynamic-column-styles');
+            if (!styleTag) {
+              styleTag = document.createElement('style');
+              styleTag.id = 'dynamic-column-styles';
+              document.head.appendChild(styleTag);
+            }
+            const selector = '#trace-panel .' + cls;
+            const newRule = selector + ' { width: ' + newW + 'px !important; }';
+            
+            // Efficiently update the rule
+            const sheet = styleTag.sheet;
+            let ruleIdx = -1;
+            for (let i = 0; i < sheet.cssRules.length; i++) {
+              if (sheet.cssRules[i].selectorText === selector) { ruleIdx = i; break; }
+            }
+            if (ruleIdx !== -1) sheet.deleteRule(ruleIdx);
+            sheet.insertRule(newRule, 0);
+          }
+        };
+        const onMouseUp = () => {
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+          document.body.style.cursor = '';
+        };
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+        document.body.style.cursor = 'col-resize';
+      });
+    }
   });
 
   // Row hover + click handlers
   container.querySelectorAll('tr.trace-row').forEach(row => {
     row.addEventListener('click', (ev) => {
       if (ev.target.closest('a')) return; // let link navigate, don't select row
-      const id = parseInt(row.dataset.spanId);
-      const span = spanById[id];
+      const uid = row.dataset.spanUid;
+      const span = spanByUid[uid];
       if (!span) return;
       selectedSpan = (selectedSpan === span) ? null : span;
       drawTimeline();
       buildTraceListPanel(lo, hi);
     });
     row.addEventListener('mouseenter', () => {
-      const id = parseInt(row.dataset.spanId);
-      const span = spanById[id];
+      const uid = row.dataset.spanUid;
+      const span = spanByUid[uid];
       if (span && lastHoveredSpan !== span) {
         lastHoveredSpan = span;
         drawTimeline();
@@ -1240,12 +1472,29 @@ function buildTraceListPanel(tStart, tEnd) {
 }
 
 
+document.getElementById('btn-toggle-samples').addEventListener('click', () => {
+  const panel = document.getElementById('sample-filter-panel');
+  const ctrl = document.getElementById('timeline-controls');
+  const container = document.getElementById('timeline-container');
+  const rh = document.getElementById('timeline-resize-handle');
+  const btn = document.getElementById('btn-toggle-samples');
+  const isOpen = container.classList.toggle('open');
+  panel.classList.toggle('open', isOpen);
+  ctrl.classList.toggle('open', isOpen);
+  btn.textContent = isOpen ? '\u25bc samples' : '\u25b6 samples';
+  rh.style.display = isOpen ? '' : 'none';
+  if (isOpen) {
+    drawTimeline();
+    buildSampleFilterPanel(viewStart, viewEnd);
+  }
+});
+
 document.getElementById('btn-toggle-aborts').addEventListener('click', () => {
   const panel = document.getElementById('trace-panel');
   const btn = document.getElementById('btn-toggle-aborts');
   const rh = document.getElementById('trace-panel-resize-handle');
   const isOpen = panel.classList.toggle('open');
-  btn.textContent = isOpen ? '\u25bc trace list' : '\u25b6 trace list';
+  btn.textContent = isOpen ? '\u25bc traces' : '\u25b6 traces';
   panel.style.height = isOpen ? tracePanelH + 'px' : '0px';
   rh.style.display = isOpen ? '' : 'none';
 });
@@ -1257,7 +1506,7 @@ document.getElementById('btn-toggle-fg').addEventListener('click', () => {
   if (container.classList.contains('open')) drawFlamegraph(viewStart, viewEnd);
 });
 
-// Sync: highlight trace list row when timeline hover changes
+// Sync: highlight traces row when timeline hover changes
 function syncTraceListHighlight(span) {
   const panel = document.getElementById('trace-panel');
   if (!panel) return;
@@ -1275,39 +1524,54 @@ function syncTraceListHighlight(span) {
 }
 
 // --- Build trace spans (connect start → stop/abort) with depth-based nesting ---
+// Use generation:id as unique key (uid) so trace ID reuse across flushes is safe
+function traceUid(gen, id) { return gen + ':' + id; }
 const traceSpans = [];
-const spanById = {};
-const childrenOf = {};
+const spanByUid = {};
+const childrenOfUid = {};
 const flushTimes = [];
 {
   const pending = {};
   for (const e of EVENTS) {
     if (e.type === 'trace_start') {
-      pending[e.id] = e;
+      pending[traceUid(e.generation, e.id)] = e;
     } else if (e.type === 'trace_stop' || e.type === 'trace_abort') {
-      const start = pending[e.id];
+      const uid = traceUid(e.generation, e.id);
+      const start = pending[uid];
       if (start) {
+        const parentUid = start.parent_id != null ? traceUid(start.generation, start.parent_id) : null;
         const span = {
           id: e.id,
+          uid: uid,
+          generation: e.generation,
           t0: start.time,
           t1: e.time,
           start: start,
           end: e,
           depth: start.depth || 0,
           outcome: e.type === 'trace_stop' ? 'stop' : 'abort',
-          category: e.type === 'trace_stop' ? 'completed' : (e.abort_reason || '?'),
+          category: (function() {
+            if (e.type === 'trace_stop') {
+              const lt = e.linktype || '?';
+              if (lt === 'root') return 'linked';
+              if (lt === 'stitch') return 'stitch';
+              return 'OK';
+            }
+            return 'aborted';
+          })(),
+          abort_reason: e.type === 'trace_abort' ? (e.abort_reason || '?') : null,
         };
         traceSpans.push(span);
-        spanById[e.id] = span;
-        if (start.parent_id) {
-          if (!childrenOf[start.parent_id]) childrenOf[start.parent_id] = [];
-          childrenOf[start.parent_id].push(span);
+        spanByUid[uid] = span;
+        if (parentUid) {
+          if (!childrenOfUid[parentUid]) childrenOfUid[parentUid] = [];
+          childrenOfUid[parentUid].push(span);
         }
-        delete pending[e.id];
+        delete pending[uid];
       }
     } else if (e.type === 'trace_flush') {
       flushTimes.push(e.time);
-      for (const id in pending) delete pending[id];
+      for (const uid in pending) delete pending[uid];
     }
   }
 }
@@ -1318,26 +1582,34 @@ let maxTraceDepth = 0;
 for (const span of traceSpans) {
   if (span.depth > maxTraceDepth) maxTraceDepth = span.depth;
 }
-const totalLanes = Math.max(5, maxTraceDepth + 1);
+const totalLanes = Math.max(5, maxTraceDepth);
 
 let visibleSpanRects = [];
 let lastHoveredSpan = null;
 let selectedSpan = null;
 let panClickSpanCandidate = null; // span under cursor at mousedown in trace area
-let lastPanelRangeKey = '';
 
 // --- Trace filter ---
 const allTraceCategories = {};
+const allAbortReasons = {};
 for (const span of traceSpans) {
   allTraceCategories[span.category] = (allTraceCategories[span.category] || 0) + 1;
+  if (span.abort_reason) {
+    allAbortReasons[span.abort_reason] = (allAbortReasons[span.abort_reason] || 0) + 1;
+  }
 }
 {
   let fc = 0;
   for (const e of EVENTS) if (e.type === 'trace_flush') fc++;
-  if (fc > 0) allTraceCategories['trace_flush'] = fc;
+  if (fc > 0) allTraceCategories['flush'] = fc;
 }
 const enabledCategories = new Set(Object.keys(allTraceCategories));
-const categoryList = Object.entries(allTraceCategories).sort((a, b) => b[1] - a[1]);
+const enabledAbortReasons = new Set(Object.keys(allAbortReasons));
+
+const mainCategoryOrder = ['OK', 'linked', 'stitch', 'aborted', 'flush'];
+const categoryList = mainCategoryOrder.map(cat => [cat, allTraceCategories[cat] || 0]);
+
+const abortReasonList = Object.entries(allAbortReasons).sort((a, b) => b[1] - a[1]);
 
 function buildFilterPanel(tStart, tEnd) {
   const lo = (tStart !== undefined) ? tStart : viewStart;
@@ -1346,78 +1618,200 @@ function buildFilterPanel(tStart, tEnd) {
 
   // Recalculate what categories are actually visible in current range
   const zoomCategories = {};
+  const zoomAbortReasons = {};
   for (const span of traceSpans) {
     const t = span.t0 - timeOrigin;
     if (span.t1 - timeOrigin < lo || t > hi) continue;
     zoomCategories[span.category] = (zoomCategories[span.category] || 0) + 1;
+    if (span.abort_reason) {
+      zoomAbortReasons[span.abort_reason] = (zoomAbortReasons[span.abort_reason] || 0) + 1;
+    }
   }
   {
     for (const e of EVENTS) {
       if (e.type !== 'trace_flush') continue;
       const t = e.time - timeOrigin;
       if (t < lo || t > hi) continue;
-      zoomCategories['trace_flush'] = (zoomCategories['trace_flush'] || 0) + 1;
+      zoomCategories['flush'] = (zoomCategories['flush'] || 0) + 1;
     }
   }
 
-  const allSelected = categoryList.every(([cat]) => enabledCategories.has(cat));
-  const noneSelected = enabledCategories.size === 0;
-  const allActive = allSelected ? `color:${COLORS.ok}` : '';
-  const noneActive = noneSelected ? 'border-color:#ef6461;color:#ef6461;background:#3e1e1e' : '';
+  const allSelected = categoryList.every(([cat]) => enabledCategories.has(cat)) && abortReasonList.every(([r]) => enabledAbortReasons.has(r));
+  const noneSelected = enabledCategories.size === 0 && enabledAbortReasons.size === 0;
 
-  const totalZoom = Object.values(zoomCategories).reduce((a,b)=>a+b,0);
-  const allCheckedStyle = allSelected ? `color:${COLORS.ok}` : 'color:#888';
-  const noneCheckedStyle = noneSelected ? 'color:#ef6461' : 'color:#888';
+  const totalZoom = Object.values(zoomCategories).reduce((a,b)=>a+b,0) + Object.values(zoomAbortReasons).reduce((a,b)=>a+b,0);
 
   let html = '<div class="filter-grid">';
-  html += `<span class="filter-all-btn" id="filter-all" style="${allCheckedStyle}"><span class="custom-cb">${allSelected ? '☑' : '☐'}</span> all <span class="filter-count">(${totalZoom})</span></span>`;
-  html += `<span class="filter-none-btn" id="filter-none" style="${noneCheckedStyle}"><span class="custom-cb">${noneSelected ? '☑' : '☐'}</span> none</span>`;
+  
+  // Main categories
   categoryList.forEach(([cat, count], idx) => {
-    const color = cat === 'completed' ? COLORS.ok : COLORS.abort;
+    let color = COLORS.ok;
+    if (cat === 'aborted') color = COLORS.abort;
+    if (cat === 'stitch') color = COLORS.stitch;
+    if (cat === 'linked') color = COLORS.linked;
+    if (cat === 'flush') color = COLORS.abort;
+
     const isEnabled = enabledCategories.has(cat);
     const checkedChar = isEnabled ? '☑' : '☐';
-    const checkedStyle = isEnabled ? `` : 'color:#888';
     const escaped = cat.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
     const zoomCount = zoomCategories[cat] || 0;
     const countStyle = zoomCount === 0 ? `color:${COLORS.borderStrong}` : `color:${COLORS.textFaint}`;
-    html += `<label style="${zoomCount === 0 ? 'opacity:0.5' : ''}; ${checkedStyle}" data-cat-idx="${idx}"><span class="custom-cb">${checkedChar}</span> <span style="color:${color}">■</span> ${escaped} <span class="filter-count" style="${countStyle}">(${zoomCount})</span></label>`;
+    let icon = `<span style="color:${color}">■</span>`;
+    if (cat === 'flush') {
+      icon = `<span style="color:${color}; border: 1px dashed ${color}; width: 10px; height: 10px; display: inline-block; vertical-align: middle; margin-right: 2px;"></span>`;
+    }
+    html += `<label class="${isEnabled ? '' : 'disabled'}" style="${zoomCount === 0 ? 'opacity:0.5' : ''}" data-cat-idx="${idx}"><span class="custom-cb">${checkedChar}</span> ${icon} ${escaped} <span class="filter-count" style="${countStyle}">(${zoomCount})</span></label>`;
   });
+
+  const abortedChecked = enabledCategories.has('aborted');
+  if (abortedChecked && abortReasonList.length > 0) {
+    html += '<div class="filter-separator"></div>';
+    // Abort reasons
+    abortReasonList.forEach(([reason, count], idx) => {
+      const isEnabled = enabledAbortReasons.has(reason);
+      const checkedChar = isEnabled ? '☑' : '☐';
+      const escaped = reason.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+      const zoomCount = zoomAbortReasons[reason] || 0;
+      const countStyle = zoomCount === 0 ? `color:${COLORS.borderStrong}` : `color:${COLORS.textFaint}`;
+      html += `<label class="${isEnabled ? '' : 'disabled'}" style="${zoomCount === 0 ? 'opacity:0.5' : ''}" data-reason-idx="${idx}"><span class="custom-cb">${checkedChar}</span> ${escaped} <span class="filter-count" style="${countStyle}">(${zoomCount})</span></label>`;
+    });
+  }
+
   html += '</div>';
   panel.innerHTML = html;
 
-  function syncFilterButtonStyles() {
-    const allSel = categoryList.every(([c]) => enabledCategories.has(c));
-    const noneSel = enabledCategories.size === 0;
-    const allBtn = document.getElementById('filter-all');
-    const noneBtn = document.getElementById('filter-none');
-    if (allBtn) { allBtn.style.color = allSel ? COLORS.ok : COLORS.textDim; allBtn.querySelector('.custom-cb').textContent = allSel ? '☑' : '☐'; }
-    if (noneBtn) { noneBtn.style.color = noneSel ? COLORS.abort : COLORS.textDim; noneBtn.querySelector('.custom-cb').textContent = noneSel ? '☑' : '☐'; }
-  }
+  panel.addEventListener('mouseleave', () => {
+    hoverCategory = null;
+    hoverAbortReason = null;
+    drawTimeline();
+  });
 
   panel.querySelectorAll('label[data-cat-idx]').forEach(label => {
     label.addEventListener('click', () => {
       const idx = parseInt(label.dataset.catIdx);
       const cat = categoryList[idx][0];
-      if (enabledCategories.has(cat)) enabledCategories.delete(cat);
-      else enabledCategories.add(cat);
+      if (enabledCategories.has(cat)) {
+        enabledCategories.delete(cat);
+      } else {
+        enabledCategories.add(cat);
+        // Reset all abort reasons to checked when "aborted" is re-enabled
+        if (cat === 'aborted') {
+          abortReasonList.forEach(([reason]) => enabledAbortReasons.add(reason));
+        }
+      }
       
       const isEnabled = enabledCategories.has(cat);
       label.querySelector('.custom-cb').textContent = isEnabled ? '☑' : '☐';
-      label.style.color = isEnabled ? '' : '#888';
+      label.classList.toggle('disabled', !isEnabled);
 
+      hoverCategory = null;
+      hoverAbortReason = null;
       drawTimeline();
-      syncFilterButtonStyles();
+      // Use buildFilterPanel directly since we need to toggle the visibility of the reasons section immediately
+      buildFilterPanel(lo, hi);
       schedulePanelUpdate(lo, hi);
+      scheduleFlamegraph(lo, hi);
+    });
+    label.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const idx = parseInt(label.dataset.catIdx);
+      const cat = categoryList[idx][0];
+      
+      const isSolo = enabledCategories.has(cat) && enabledCategories.size === 1;
+      if (isSolo) {
+        // Inverse: check everything except aborted reasons (just the main categories)
+        categoryList.forEach(([c]) => enabledCategories.add(c));
+        abortReasonList.forEach(([r]) => enabledAbortReasons.add(r));
+      } else {
+        enabledCategories.clear();
+        enabledCategories.add(cat);
+        if (cat === 'aborted') {
+          abortReasonList.forEach(([reason]) => enabledAbortReasons.add(reason));
+        } else {
+          enabledAbortReasons.clear();
+        }
+      }
+      hoverCategory = null;
+      hoverAbortReason = null;
+      drawTimeline();
+      buildFilterPanel(lo, hi);
+      schedulePanelUpdate(lo, hi);
+      scheduleFlamegraph(lo, hi);
+    });
+    label.addEventListener('mouseenter', () => {
+      const idx = parseInt(label.dataset.catIdx);
+      hoverCategory = categoryList[idx][0];
+      drawTimeline();
+    });
+    label.addEventListener('mouseleave', () => {
+      hoverCategory = null;
+      drawTimeline();
     });
   });
+  panel.querySelectorAll('label[data-reason-idx]').forEach(label => {
+    label.addEventListener('click', () => {
+      const idx = parseInt(label.dataset.reasonIdx);
+      const reason = abortReasonList[idx][0];
+      if (enabledAbortReasons.has(reason)) enabledAbortReasons.delete(reason);
+      else enabledAbortReasons.add(reason);
+      
+      const isEnabled = enabledAbortReasons.has(reason);
+      label.querySelector('.custom-cb').textContent = isEnabled ? '☑' : '☐';
+      label.classList.toggle('disabled', !isEnabled);
+
+      hoverCategory = null;
+      hoverAbortReason = null;
+      drawTimeline();
+      schedulePanelUpdate(lo, hi);
+      scheduleFlamegraph(lo, hi);
+    });
+    label.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      const idx = parseInt(label.dataset.reasonIdx);
+      const reason = abortReasonList[idx][0];
+
+      const isSolo = enabledCategories.size === 1 && enabledCategories.has('aborted') && 
+                     enabledAbortReasons.size === 1 && enabledAbortReasons.has(reason);
+      
+      if (isSolo) {
+        categoryList.forEach(([c]) => enabledCategories.add(c));
+        abortReasonList.forEach(([r]) => enabledAbortReasons.add(r));
+      } else {
+        enabledCategories.clear();
+        enabledCategories.add('aborted');
+        enabledAbortReasons.clear();
+        enabledAbortReasons.add(reason);
+      }
+      hoverCategory = null;
+      hoverAbortReason = null;
+      drawTimeline();
+      buildFilterPanel(lo, hi);
+      schedulePanelUpdate(lo, hi);
+      scheduleFlamegraph(lo, hi);
+    });
+    label.addEventListener('mouseenter', () => {
+      const idx = parseInt(label.dataset.reasonIdx);
+      hoverAbortReason = abortReasonList[idx][0];
+      hoverCategory = 'aborted';
+      drawTimeline();
+    });
+    label.addEventListener('mouseleave', () => {
+      hoverAbortReason = null;
+      hoverCategory = null;
+      drawTimeline();
+    });
+  });
+
   document.getElementById('filter-all')?.addEventListener('click', () => {
     categoryList.forEach(([cat]) => enabledCategories.add(cat));
+    abortReasonList.forEach(([reason]) => enabledAbortReasons.add(reason));
     drawTimeline();
     buildFilterPanel(lo, hi);
     schedulePanelUpdate(lo, hi);
   });
   document.getElementById('filter-none')?.addEventListener('click', () => {
     enabledCategories.clear();
+    enabledAbortReasons.clear();
     drawTimeline();
     buildFilterPanel(lo, hi);
     schedulePanelUpdate(lo, hi);
@@ -1486,6 +1880,11 @@ function drawTimeline() {
 
   const vDur = viewEnd - viewStart || 1;
 
+  // Layout: vm state (top, smaller) + traces (bottom, larger)
+  sampleH = Math.min(30, Math.max(20, Math.round(h * 0.14)));
+  const traceY = sampleH + 4; // 4px gap for divider
+  const traceH = h - traceY;
+
   // Draw section bands first (background)
   const sectionStarts = {};
   for (const e of EVENTS) {
@@ -1512,13 +1911,8 @@ function drawTimeline() {
     }
   }
 
-  // Layout: vm state (top, smaller) + traces (bottom, larger)
-  sampleH = Math.min(35, Math.round(h * 0.14));
-  const traceY = sampleH + 4; // 4px gap for divider
-  const traceH = h - traceY;
-
   // Draw trace_flush as subtle bands in sample area (prominent rendering is in trace area below)
-  if (enabledCategories.has('trace_flush')) {
+  if (enabledCategories.has('flush')) {
     for (const ft of flushTimes) {
       const t = ft - timeOrigin;
       if (t < viewStart || t > viewEnd) continue;
@@ -1538,6 +1932,15 @@ function drawTimeline() {
     const x = ((t - viewStart) / vDur) * w;
 
     if (e.type === 'sample') {
+      let isVisible;
+      if (hoverState || hoverSection) {
+        isVisible = (!hoverState || e.vm_state === hoverState) && (!hoverSection || e.section_path === hoverSection);
+      } else {
+        const isVisibleState = enabledStates.has(e.vm_state);
+        const isVisibleSection = !e.section_path || enabledSections.has(e.section_path);
+        isVisible = isVisibleState && isVisibleSection;
+      }
+      if (!isVisible) continue;
       const matchesPie = !pieHoveredState || e.vm_state === pieHoveredState;
       if (!matchesPie) continue;
       tlCtx.fillStyle = sampleColor(e);
@@ -1602,41 +2005,19 @@ function drawTimeline() {
     return [COLORS.ok, COLORS.ok];
   }
 
-  // Draw FLUSH lines (prominent, full height of trace region)
-  if (enabledCategories.has('trace_flush')) {
-    tlCtx.save();
-    tlCtx.setLineDash([5, 4]);
-    tlCtx.strokeStyle = COLORS.abort;
-    tlCtx.lineWidth = 2;
-    tlCtx.font = 'bold 9px monospace';
-    tlCtx.fillStyle = COLORS.abort;
-    for (const ft of flushTimes) {
-      const t = ft - timeOrigin;
-      if (t < viewStart || t > viewEnd) continue;
-      const fx = ((t - viewStart) / vDur) * w;
-      // Semi-transparent band
-      tlCtx.fillStyle = COLORS.flushBand;
-      tlCtx.fillRect(fx - 8, traceY, 16, traceH);
-      // Dashed line
-      tlCtx.strokeStyle = COLORS.abort;
-      tlCtx.beginPath();
-      tlCtx.moveTo(fx, traceY);
-      tlCtx.lineTo(fx, traceY + traceH);
-      tlCtx.stroke();
-      // Label
-      tlCtx.fillStyle = COLORS.abort;
-      tlCtx.fillText('FLUSH', fx + 3, traceY + 10);
-    }
-    tlCtx.restore();
-  }
-
   // Draw trace spans in depth-based swimlanes
   visibleSpanRects = [];
   let hoveredSpan = null;
 
   const TRACE_W = 8;
   for (const span of traceSpans) {
-    if (!enabledCategories.has(span.category)) continue;
+    if (hoverCategory) {
+      if (span.category !== hoverCategory) continue;
+      if (hoverCategory === 'aborted' && hoverAbortReason && span.abort_reason !== hoverAbortReason) continue;
+    } else {
+      if (!enabledCategories.has(span.category)) continue;
+      if (span.abort_reason && !enabledAbortReasons.has(span.abort_reason)) continue;
+    }
     const st = span.t0 - timeOrigin;
     if (st < viewStart - (TRACE_W / (w / vDur)) || st > viewEnd) continue;
 
@@ -1651,14 +2032,6 @@ function drawTimeline() {
 
     tlCtx.fillStyle = fill;
     tlCtx.fillRect(x0, by, bw, barH);
-
-    // Label if wide enough
-    if (bw > 28) {
-      tlCtx.fillStyle = COLORS.spanLabel;
-      tlCtx.font = '9px monospace';
-      const lb = '#' + span.id + (span.outcome === 'abort' ? ' ✗' : '');
-      tlCtx.fillText(lb, x0 + 2, by + barH - 3, bw - 4);
-    }
 
     visibleSpanRects.push({x: x0, y: by, w: bw, h: barH, span: span});
   }
@@ -1690,15 +2063,15 @@ function drawTimeline() {
 
     function drawSpanTree(hs, hotColor, dimColor) {
       let root = hs;
-      while (root.start.parent_id && spanById[root.start.parent_id]) {
-        root = spanById[root.start.parent_id];
+      while (root.start.parent_id && spanByUid[traceUid(root.start.generation, root.start.parent_id)]) {
+        root = spanByUid[traceUid(root.start.generation, root.start.parent_id)];
       }
       tlCtx.setLineDash([3, 3]);
       tlCtx.lineWidth = 1.5;
       const treeQueue = [root];
       while (treeQueue.length > 0) {
         const node = treeQueue.shift();
-        const kids = childrenOf[node.id];
+        const kids = childrenOfUid[node.uid];
         if (!kids) continue;
         for (const child of kids) {
           const isHot = (node === hs || child === hs);
@@ -1717,6 +2090,7 @@ function drawTimeline() {
       drawSpanTree(lastHoveredSpan, COLORS.hoverTreeLine, COLORS.hoverTreeFill);
     }
 
+    tlCtx.restore();
     tlCtx.setLineDash([]);
 
     // Glow selected span
@@ -1757,7 +2131,6 @@ function drawTimeline() {
     tlCtx.fillStyle = COLORS.textMuted;
     tlCtx.fillText(text, x, y);
   }
-  drawCanvasLabel('vm state', 4, 10);
 
   // Inline canvas legends — shown only while the timeline is hovered
   if (tlHovered) {
@@ -1789,25 +2162,6 @@ function drawTimeline() {
         ix += swatchW + gap + tlCtx.measureText(label).width + itemGap;
       }
     }
-    // VM state legend — bottom-center of vm state area
-    const vmItems = [
-      {color: COLORS.ok,    label: 'native'},
-      {color: COLORS.stitch,label: 'interpreter'},
-      {color: COLORS.linked,label: 'c'},
-      {color: COLORS.abort, label: 'gc'},
-      {color: COLORS.jit,   label: 'jit'},
-    ];
-    drawInlineLegend(vmItems, w / 2, sampleH - 4);
-    // Trace type legend — center of root trace lane (lane 0)
-    const rootMidY = h - 3;
-    const traceItems = [
-      {color: COLORS.ok,    label: 'OK'},
-      {color: COLORS.linked,label: 'Linked'},
-      {color: COLORS.stitch,label: 'Stitch'},
-      {color: COLORS.abort, label: 'Aborted'},
-      {color: COLORS.abort, label: 'Flush', dashed: true},
-    ];
-    drawInlineLegend(traceItems, w / 2, rootMidY);
   }
   // Depth labels: root trace, d1, d2, d3, d.., d{maxDepth}
   {
@@ -1837,12 +2191,49 @@ function drawTimeline() {
     }
   }
 
+  // Draw FLUSH lines (prominent, full height of trace region)
+  // Drawn last so they sit on top of everything else
+  if (enabledCategories.has('flush')) {
+    tlCtx.save();
+    tlCtx.setLineDash([5, 4]);
+    tlCtx.strokeStyle = COLORS.abort;
+    tlCtx.lineWidth = 2;
+    tlCtx.font = 'bold 9px monospace';
+    tlCtx.fillStyle = COLORS.abort;
+    for (const ft of flushTimes) {
+      const t = ft - timeOrigin;
+      if (t < viewStart || t > viewEnd) continue;
+      const fx = ((t - viewStart) / vDur) * w;
+      // Semi-transparent band
+      tlCtx.fillStyle = COLORS.flushBand;
+      tlCtx.fillRect(fx - 4, traceY, 8, traceH);
+      // Dashed line
+      tlCtx.strokeStyle = COLORS.abort;
+      tlCtx.beginPath();
+      tlCtx.moveTo(fx, traceY);
+      tlCtx.lineTo(fx, traceY + traceH);
+      tlCtx.stroke();
+      // Label in VM area with black background
+      tlCtx.font = 'bold 9px monospace';
+      const txt = 'FLUSH';
+      const tw = tlCtx.measureText(txt).width;
+      tlCtx.fillStyle = '#000';
+      tlCtx.fillRect(fx + 2, 2, tw + 4, 11);
+      tlCtx.fillStyle = COLORS.abort;
+      tlCtx.fillText(txt, fx + 4, 11);
+    }
+    tlCtx.restore();
+  }
+
 
   // Schedule panel updates (debounced) — avoids rebuilding DOM on every canvas frame
+  const currentFilterStateKey = Array.from(enabledStates).sort().join(',') + '|' + Array.from(enabledSections).sort().join(',') + '|' + (hoverState || '') + '|' + (hoverSection || '') + '|' + (hoverCategory || '') + '|' + (hoverAbortReason || '');
   const rangeKey = currentRange[0].toFixed(6) + ':' + currentRange[1].toFixed(6);
-  if (rangeKey !== lastPanelRangeKey) {
+  if (rangeKey !== lastPanelRangeKey || currentFilterStateKey !== lastFilterStateKey) {
     lastPanelRangeKey = rangeKey;
+    lastFilterStateKey = currentFilterStateKey;
     schedulePanelUpdate(currentRange[0], currentRange[1]);
+    scheduleFlamegraph(currentRange[0], currentRange[1]);
   }
 }
 
@@ -1916,7 +2307,7 @@ function formatSpanTooltip(span) {
   if (span.start.func_info) s += `\n ${funcInfoLink(span.start.func_info)}`;
   if (span.start.parent_id) s += `\n↑ parent #${span.start.parent_id} (exit ${span.start.exit_id})`;
   if (span.end.func_info && span.end.func_info !== span.start.func_info) s += `\n   → ${funcInfoLink(span.end.func_info)}`;
-  const kids = childrenOf[span.id];
+  const kids = childrenOfUid[span.uid];
   if (kids && kids.length > 0) {
     const okKids = kids.filter(k => k.outcome === 'stop').length;
     const abKids = kids.length - okKids;
@@ -1928,11 +2319,17 @@ function formatSpanTooltip(span) {
 }
 
 tlCanvas.addEventListener('mousedown', (ev) => {
-  hideTooltip();
+  if (ev.button !== 0) return; // Only handle left clicks
+
+  // Force a redraw/measurement if sampleH or rect is somehow stale
+  if (sampleH === 0) drawTimeline();
   const rect = getTlRect();
   const mouseY = ev.clientY - rect.top;
-  const curSampleH = Math.min(35, Math.round(rect.height * 0.14));
-  if (mouseY <= curSampleH) {
+  const inSampleRegion = mouseY < sampleH;
+
+  hideTooltip();
+
+  if (inSampleRegion) {
     // VM state area — draw selection
     dragMode = 'select';
     selStart = tlXToTime(ev.clientX);
@@ -1961,8 +2358,7 @@ tlCanvas.addEventListener('mousemove', (ev) => {
   const mouseX = ev.clientX - rect.left;
   const mouseY = ev.clientY - rect.top;
   const h = rect.height;
-  const curSampleH = Math.min(35, Math.round(h * 0.14));
-  const inSampleRegion = mouseY < curSampleH;
+  const inSampleRegion = mouseY < sampleH;
 
   let tooltipContent = null;
 
@@ -2054,8 +2450,6 @@ window.addEventListener('mousemove', (ev) => {
     if (newEnd > timeDuration) { newStart -= (newEnd - timeDuration); newEnd = timeDuration; }
     viewStart = Math.max(0, newStart);
     viewEnd = Math.min(timeDuration, newEnd);
-    selStart = viewStart; selEnd = viewEnd;
-    document.getElementById('selection-info').textContent = formatSelInfo(viewStart, viewEnd);
     refreshView(viewStart, viewEnd);
   }
 });
@@ -2067,13 +2461,6 @@ window.addEventListener('mouseup', () => {
   if (mode === 'select') {
     if (selStart !== null && selEnd !== null) {
       let lo = Math.min(selStart, selEnd), hi = Math.max(selStart, selEnd);
-      if (hi - lo <= 0.0001) {
-        // Single click — select full current view
-        selStart = viewStart; selEnd = viewEnd;
-        lo = viewStart; hi = viewEnd;
-      }
-      const info = document.getElementById('selection-info');
-      info.textContent = formatSelInfo(lo, hi);
       updateSelOverlay();
       drawFlamegraph(lo, hi);
     }
@@ -2096,30 +2483,48 @@ window.addEventListener('mouseup', () => {
 
 function updateSelOverlay() {
   if (selStart === null || selEnd === null) { selOverlay.style.display = 'none'; return; }
-  // Use cached rect — getBoundingClientRect forces layout reflow, avoid calling it every tick
   const rect = getTlRect();
   const vDur = viewEnd - viewStart || 1;
   const lo = Math.min(selStart, selEnd), hi = Math.max(selStart, selEnd);
   const lx = ((lo - viewStart) / vDur) * rect.width;
   const rx = ((hi - viewStart) / vDur) * rect.width;
+
   selOverlay.style.left = lx + 'px';
   selOverlay.style.width = Math.max(1, rx - lx) + 'px';
-  selOverlay.style.height = sampleH + 'px';
   selOverlay.style.display = 'block';
-  // Time labels
+
+  // Exception for 0-100% full selection
+  const isFull = (lx <= 0 && rx >= rect.width);
+  selOverlay.style.background = isFull ? 'transparent' : 'var(--accent-dim)';
+
+  // Time labels with clamping
   const startEl = document.getElementById('sel-t-start');
   const endEl = document.getElementById('sel-t-end');
-  if (startEl) startEl.textContent = lo.toFixed(4) + 's';
-  if (endEl) endEl.textContent = hi.toFixed(4) + 's';
-  // NOTE: panels are updated via drawTimeline's debounced schedulePanelUpdate, not here,
-  // to avoid double-building them on every wheel/drag tick.
+
+  if (startEl) {
+    startEl.textContent = lo.toFixed(4) + 's';
+    const w = startEl.offsetWidth;
+    let offsetX = -w / 2;
+    if (lx + offsetX < 0) offsetX = -lx;
+    if (lx + offsetX + w > rect.width) offsetX = rect.width - lx - w;
+    startEl.style.transform = `translate(${offsetX}px, 2px)`; // Moved inside VM area
+  }
+  if (endEl) {
+    endEl.textContent = hi.toFixed(4) + 's';
+    const w = endEl.offsetWidth;
+    let offsetX = -w / 2;
+    const absRx = rx;
+    if (absRx + offsetX < 0) offsetX = -absRx;
+    if (absRx + offsetX + w > rect.width) offsetX = rect.width - absRx - w;
+    endEl.style.transform = `translate(${offsetX}px, 2px)`; // Moved inside VM area
+  }
+
   schedulePanelUpdate(lo, hi);
 }
 
 document.getElementById('btn-reset').addEventListener('click', () => {
   viewStart = 0; viewEnd = timeDuration;
   selStart = 0; selEnd = timeDuration;
-  document.getElementById('selection-info').textContent = formatSelInfo(0, timeDuration);
   refreshView(0, timeDuration, true);
 });
 
@@ -2129,7 +2534,6 @@ document.getElementById('btn-zoom-sel').addEventListener('click', () => {
     if (hi - lo > 0.0001) {
       viewStart = lo; viewEnd = hi;
       selStart = viewStart; selEnd = viewEnd;
-      document.getElementById('selection-info').textContent = formatSelInfo(viewStart, viewEnd);
       refreshView(viewStart, viewEnd, true);
     }
   }
@@ -2144,9 +2548,6 @@ tlCanvas.addEventListener('wheel', (ev) => {
   const newEnd = mouseT + (viewEnd - mouseT) * zoomFactor;
   viewStart = Math.max(0, newStart);
   viewEnd = Math.min(timeDuration, newEnd);
-  // Keep selection in sync with view
-  selStart = viewStart; selEnd = viewEnd;
-  document.getElementById('selection-info').textContent = formatSelInfo(viewStart, viewEnd);
   // Canvas redraws immediately; panels + flamegraph are debounced to avoid
   // rebuilding expensive DOM on every wheel tick.
   refreshView(viewStart, viewEnd);
@@ -2189,7 +2590,7 @@ function computeDefaultTimelineH() {
   return Math.max(80, Math.round(35 + 4 + lanesH + 6));
 }
 
-makeResizable(document.getElementById('timeline-resize-handle'), 40,
+makeResizable(document.getElementById('timeline-resize-handle'), 25,
   () => timelineContainerH,
   (h) => { timelineContainerH = h; tlContainer.style.height = h + 'px'; invalidateTlRect(); drawTimeline(); updateSelOverlay(); }
 );
@@ -2201,17 +2602,26 @@ let fgRects = [];
 
 function buildFlamegraph(tStart, tEnd) {
   const stacks = [];
+  const currentEnabledStates = new Set(enabledStates);
+  const currentEnabledSections = new Set(enabledSections);
+
   for (const e of EVENTS) {
     if (e.type !== 'sample') continue;
     const t = e.time - timeOrigin;
     if (t < tStart || t > tEnd) continue;
     if (!e.stack) continue;
-    // Filter out samples belonging to disabled sections
-    if (e.section_path) {
-      const rootSec = e.section_path.split(' > ')[0];
-      if (ALL_SECTIONS.includes(rootSec) && !enabledSections.has(rootSec)) continue;
+    // Filter out samples belonging to disabled sections or non-hovered state/section
+    if (hoverState || hoverSection) {
+      if (hoverState && e.vm_state !== hoverState) continue;
+      if (hoverSection && e.section_path !== hoverSection) continue;
     } else {
-      if (!enabledSections.has(SECTION_OTHER)) continue;
+      if (!currentEnabledStates.has(e.vm_state)) continue;
+      if (e.section_path) {
+        const rootSec = e.section_path.split(' > ')[0];
+        if (ALL_SECTIONS.includes(rootSec) && !currentEnabledSections.has(rootSec)) continue;
+      } else {
+        if (!currentEnabledSections.has(SECTION_OTHER)) continue;
+      }
     }
     const lines = e.stack.split('\n').filter(l => l.trim().length > 0);
     const reversed = lines.slice().reverse();
@@ -2247,13 +2657,15 @@ const FG_FONT_SIZE = 11;
 const FG_MIN_WIDTH_PX = 2;
 
 function drawFlamegraph(tStart, tEnd) {
+  const container = document.getElementById('flamegraph-container');
+  if (!container || !container.classList.contains('open')) return;
   const {root, maxDepth, totalSamples} = buildFlamegraph(tStart, tEnd);
   const containerW = fgCanvas.parentElement.clientWidth;
   const canvasH = Math.max(400, (maxDepth + 2) * FG_ROW_HEIGHT + 40);
 
   setupCanvas(fgCanvas, containerW, canvasH);
 
-  fgCtx.fillStyle = COLORS.bgBase;
+  fgCtx.fillStyle = COLORS.bgDeep;
   fgCtx.fillRect(0, 0, containerW, canvasH);
 
   if (totalSamples === 0) {
@@ -2267,11 +2679,7 @@ function drawFlamegraph(tStart, tEnd) {
   fgCtx.font = FG_FONT_SIZE + 'px monospace';
   fgRects = [];
 
-  fgCtx.fillStyle = COLORS.textDim;
-  fgCtx.font = '11px monospace';
-  fgCtx.fillText(`${totalSamples} samples in ${(tEnd - tStart).toFixed(4)}s`, 8, 14);
-
-  const yOffset = 24;
+  const yOffset = 8;
   const totalWidth = containerW - 16;
   const xOffset = 8;
 
@@ -2280,7 +2688,7 @@ function drawFlamegraph(tStart, tEnd) {
     for (let i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
     h = Math.abs(h);
     const hue = (h % 40) + 10;
-    const sat = 60 + (h % 30);
+    const sat = 50 + (h % 30);
     const lit = 45 + (h % 20);
     return `hsl(${hue}, ${sat}%, ${lit}%)`;
   }
@@ -2290,12 +2698,11 @@ function drawFlamegraph(tStart, tEnd) {
     if (w < FG_MIN_WIDTH_PX) return;
 
     const y = yOffset + depth * FG_ROW_HEIGHT;
-    const rectH = FG_ROW_HEIGHT - 2;
+    const rectH = FG_ROW_HEIGHT;
 
     fgCtx.fillStyle = depth === 0 ? COLORS.border : colorForFrame(node.name);
-    fgCtx.fillRect(xStart, y, w - 1, rectH);
-    fgCtx.strokeStyle = COLORS.bgBase;
-    fgCtx.strokeRect(xStart, y, w - 1, rectH);
+    // Draw rect that is 1px smaller than its available space to create a 1px gap
+    fgCtx.fillRect(xStart, y, w - 1, rectH - 1);
 
     if (w > 30) {
       fgCtx.fillStyle = COLORS.white;
@@ -2303,18 +2710,18 @@ function drawFlamegraph(tStart, tEnd) {
       const label = node.name;
       const textW = fgCtx.measureText(label).width;
       if (textW < w - 6) {
-        fgCtx.fillText(label, xStart + 3, y + rectH - 4);
+        fgCtx.fillText(label, xStart + 3, y + rectH - 5);
       } else {
         let truncated = label;
         while (truncated.length > 1 && fgCtx.measureText(truncated + '…').width > w - 6) {
           truncated = truncated.slice(0, -1);
         }
-        fgCtx.fillText(truncated + '…', xStart + 3, y + rectH - 4);
+        fgCtx.fillText(truncated + '…', xStart + 3, y + rectH - 5);
       }
     }
 
     fgRects.push({
-      x: xStart, y: y, w: w - 1, h: rectH,
+      x: xStart, y: y, w: w - 1, h: rectH - 1,
       label: node.name,
       count: node.count, self: node._self, total: root.count
     });
@@ -2381,6 +2788,15 @@ fgCanvas.addEventListener('mouseleave', () => { hideTooltip(); });
 // --- Init ---
 timelineContainerH = computeDefaultTimelineH();
 tlContainer.style.height = timelineContainerH + 'px';
+
+// Trigger a sync layout pass and first draw
+requestAnimationFrame(() => {
+  invalidateTlRect();
+  drawTimeline();
+  updateSelOverlay();
+  refreshView(0, timeDuration, true);
+});
+
 // Pie chart hover — highlight matching VM state in timeline
 const vmPieCanvas = document.getElementById('vm-pie-canvas');
 vmPieCanvas.addEventListener('mousemove', (ev) => {
@@ -2420,9 +2836,7 @@ vmPieCanvas.addEventListener('mouseleave', () => {
 });
 
 window.addEventListener('resize', () => { invalidateTlRect(); refreshView(viewStart, viewEnd, true); });
-document.getElementById('selection-info').textContent = formatSelInfo(0, timeDuration);
 refreshView(0, timeDuration, true);
-buildSectionFilter();
 }); // end DOMContentLoaded
 </script>
 </body>
